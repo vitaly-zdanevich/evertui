@@ -3,7 +3,8 @@
 [![Production code](docs/badges/production-code.svg)](src)
 [![Test code](docs/badges/test-code.svg)](tests)
 
-Two-panel Evernote TUI written in Rust with embedded real `vim` in the right panel.
+Two-panel Evernote TUI written in Rust with fast plain-text preview and embedded real `vim` in the right panel.
+All note content stays strictly in RAM for performance and security (never written to `/tmp` or disk).
 Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux virtual consoles (`/dev/tty*`, `TERM=linux`) as well as modern terminal emulators.
 
 ## Features
@@ -13,7 +14,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
   - **Right panel**: Note metadata header (Title, Notebook, Tags, Created & Updated dates, size, attachment counts) + **fast native text preview** by default, replacing the preview with **real embedded `vim`** on `Enter` (`:w` saves directly to Evernote with an ASCII animated indicator).
 - **Preferences (`p` / `F7` / `Alt+p`)**:
   - `[ ] Vim preview` (unchecked by default for instant browsing; check to preview every selected note directly in embedded `vim`, saved in `~/.config/evertui/preferences.conf`).
-- **RAM-only note editing (no `/tmp` files)**: Embedded `vim` buffers and `:w` save notifications use anonymous Linux kernel memory (`memfd_create`) with swap, backup, undo, and `viminfo` disabled, so note content never touches `/tmp` or disk.
+- **Note content strictly in RAM (performance & security)**: Note previews, embedded `vim` buffers, and `:w` save notifications live exclusively in memory (using anonymous Linux kernel `memfd_create` descriptors with swap, backup, undo, and `viminfo` disabled, plus `TMPDIR` pointed at RAM `tmpfs`), so note text never touches `/tmp` or disk.
 - **Placeholders for media & attachments**: Images render as `[Image: filename.ext]` and files as `[Attachment: filename.ext]`, round-tripping safely back to `<en-media>` on `:w`.
 - **TTY-friendly pure ASCII UI**: Simple ASCII borders, spinners (`| / - \`), progress bar (`[==  ]`), and standard 16 ANSI colors (no emojis or wide Unicode symbols).
 - **Flexible search (`/`, `F3`, `Alt+s`)**:
