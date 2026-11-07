@@ -6,6 +6,7 @@ use crossterm::terminal::{
 use evertui::app::{App, TextInput};
 use evertui::auth::AuthConfig;
 use evertui::evernote_api::EdamEvernoteService;
+use evertui::preferences::Preferences;
 use evertui::ui;
 use evertui::worker::BackendHandle;
 use ratatui::Terminal;
@@ -49,7 +50,9 @@ fn try_main() -> Result<(), String> {
     install_panic_hook();
     let mut terminal = setup_terminal().map_err(|e| format!("Terminal init failed: {e}"))?;
 
-    let mut app = App::new(backend.cmd_tx.clone());
+    let prefs_path = Preferences::default_path();
+    let prefs = Preferences::load_or_default(&prefs_path);
+    let mut app = App::with_preferences(backend.cmd_tx.clone(), prefs, Some(prefs_path));
     if let Some(q) = opts.initial_query {
         app.search_input = TextInput::new(q);
         app.execute_search();

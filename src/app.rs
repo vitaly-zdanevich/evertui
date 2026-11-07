@@ -3,6 +3,7 @@ use crate::domain::{
     SearchPage, Tag,
 };
 use crate::enml::PreparedNoteDocument;
+use crate::preferences::Preferences;
 use crate::search::ParsedSearch;
 use crate::vim_pane::VimSession;
 use crate::worker::{WorkerCommand, WorkerEvent};
@@ -11,6 +12,7 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -189,6 +191,13 @@ pub struct TextPromptModal {
     pub input: TextInput,
 }
 
+pub const PREFERENCES_ITEMS_COUNT: usize = 1;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreferencesModal {
+    pub cursor: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum ModalState {
     #[default]
@@ -196,6 +205,7 @@ pub enum ModalState {
     TagEditor(TagEditorModal),
     NotebookPicker(NotebookPickerModal),
     TextPrompt(TextPromptModal),
+    Preferences(PreferencesModal),
     Help,
 }
 
@@ -337,6 +347,11 @@ pub struct App {
     pub anim_tick: usize,
     pub status_error: Option<String>,
 
+    pub preferences: Preferences,
+    pub preferences_path: Option<PathBuf>,
+    pub preview_scroll: u16,
+    pub pending_vim_guid: Option<NoteGuid>,
+
     pub vim_session: Option<VimSession>,
     pub geometry: LayoutGeometry,
 
@@ -345,6 +360,14 @@ pub struct App {
 
 impl App {
     pub fn new(cmd_tx: Sender<WorkerCommand>) -> Self {
+        Self::with_preferences(cmd_tx, Preferences::default(), None)
+    }
+
+    pub fn with_preferences(
+        cmd_tx: Sender<WorkerCommand>,
+        preferences: Preferences,
+        preferences_path: Option<PathBuf>,
+    ) -> Self {
         let _ = cmd_tx.send(WorkerCommand::Bootstrap);
         Self {
             should_quit: false,
@@ -376,11 +399,22 @@ impl App {
             anim_tick: 0,
             status_error: None,
 
+            preferences,
+            preferences_path,
+            preview_scroll: 0,
+            pending_vim_guid: None,
+
             vim_session: None,
             geometry: LayoutGeometry::default(),
 
             cmd_tx,
         }
+    }
+
+    #[must_use]
+    pub fn selected_preview_text(&self) -> Option<&str> {
+        let guid = &self.selected_summary()?.guid;
+        self.prepared_docs.get(guid).map(|d| d.markdown.as_str())
     }
 
     #[must_use]
@@ -457,8 +491,9 @@ impl App {
                 self.left_panel_visible = true;
             }
             self.focus = FocusTarget::LeftTitles;
-            // Keep the note visible in the right panel with a clean viewer session.
-            if self.selected_summary().is_some_and(|s| s.guid == guid) {
+            if self.preferences.vim_preview
+                && self.selected_summary().is_some_and(|s| s.guid == guid)
+            {
                 self.ensure_vim_for_note(&guid);
             }
         }
@@ -553,7 +588,11 @@ impl App {
                 {
                     self.loading_note_guid = None;
                 }
-                if self.selected_summary().is_some_and(|s| s.guid == guid) {
+                if self.selected_summary().is_some_and(|s| s.guid == guid)
+                    && (self.preferences.vim_preview
+                        || self.pending_vim_guid.as_ref() == Some(&guid))
+                {
+                    self.pending_vim_guid = None;
                     self.ensure_vim_for_note(&guid);
                 }
             }
@@ -700,14 +739,33 @@ impl App {
     }
 
     fn on_selection_changed(&mut self) {
+        self.preview_scroll = 0;
+        self.pending_vim_guid = None;
+
         let Some(guid) = self.selected_summary().map(|s| s.guid.clone()) else {
             self.vim_session = None;
             return;
         };
 
-        if self.note_cache.contains_key(&guid) {
+        if self
+            .vim_session
+            .as_ref()
+            .is_some_and(|v| v.note_guid != guid)
+        {
+            self.vim_session = None;
+        }
+
+        if let Some(detail) = self.note_cache.get(&guid) {
             self.loading_note_guid = None;
-            self.ensure_vim_for_note(&guid);
+            if !self.prepared_docs.contains_key(&guid) {
+                let prepared = PreparedNoteDocument::from_enml(&detail.enml, &detail.resources);
+                self.prepared_docs.insert(guid.clone(), prepared);
+            }
+            if self.preferences.vim_preview {
+                self.ensure_vim_for_note(&guid);
+            } else {
+                self.vim_session = None;
+            }
         } else {
             self.vim_session = None;
             let req_id = self.alloc_req_id();
@@ -717,6 +775,34 @@ impl App {
                 request_id: req_id,
                 guid,
             });
+        }
+    }
+
+    /// Replaces the text preview with real embedded Vim for editing the selected note.
+    pub fn open_selected_in_vim(&mut self) {
+        let Some(guid) = self.selected_summary().map(|s| s.guid.clone()) else {
+            return;
+        };
+        self.focus = FocusTarget::RightVim;
+        if self.note_cache.contains_key(&guid) {
+            self.pending_vim_guid = None;
+            self.ensure_vim_for_note(&guid);
+        } else {
+            self.pending_vim_guid = Some(guid);
+        }
+    }
+
+    pub fn scroll_preview(&mut self, delta: i16) {
+        let total_lines = self
+            .selected_preview_text()
+            .map_or(0usize, |txt| txt.lines().count().max(1));
+        let max_scroll = u16::try_from(total_lines.saturating_sub(1)).unwrap_or(u16::MAX);
+        if delta >= 0 {
+            let add = delta.unsigned_abs();
+            self.preview_scroll = self.preview_scroll.saturating_add(add).min(max_scroll);
+        } else {
+            let sub = delta.unsigned_abs();
+            self.preview_scroll = self.preview_scroll.saturating_sub(sub);
         }
     }
 
@@ -837,6 +923,31 @@ impl App {
         });
     }
 
+    pub fn open_preferences_modal(&mut self) {
+        self.modal = ModalState::Preferences(PreferencesModal::default());
+    }
+
+    pub fn toggle_preference_at(&mut self, index: usize) {
+        if index == 0 {
+            self.preferences.vim_preview = !self.preferences.vim_preview;
+            if let Some(path) = &self.preferences_path
+                && let Err(e) = self.preferences.save(path)
+            {
+                self.status_error = Some(format!("Failed to save preferences: {e}"));
+            }
+
+            if self.preferences.vim_preview {
+                if let Some(guid) = self.selected_summary().map(|s| s.guid.clone())
+                    && self.note_cache.contains_key(&guid)
+                {
+                    self.ensure_vim_for_note(&guid);
+                }
+            } else if self.focus != FocusTarget::RightVim {
+                self.vim_session = None;
+            }
+        }
+    }
+
     pub fn handle_terminal_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key),
@@ -907,6 +1018,14 @@ impl App {
                 self.open_rename_modal();
                 return;
             }
+            KeyCode::F(7) => {
+                self.open_preferences_modal();
+                return;
+            }
+            KeyCode::Char('p') if alt => {
+                self.open_preferences_modal();
+                return;
+            }
             KeyCode::Char('\\') if ctrl => {
                 if !self.left_panel_visible {
                     self.left_panel_visible = true;
@@ -931,13 +1050,45 @@ impl App {
         match self.focus {
             FocusTarget::LeftTitles => self.handle_left_panel_key(key),
             FocusTarget::SearchInput => self.handle_search_key(key),
-            FocusTarget::RightVim => {
-                if let Some(vim) = &mut self.vim_session {
-                    vim.send_key(key);
-                } else if matches!(key.code, KeyCode::Esc | KeyCode::Tab) {
-                    self.focus = FocusTarget::LeftTitles;
-                }
+            FocusTarget::RightVim => self.handle_right_panel_key(key),
+        }
+    }
+
+    fn handle_right_panel_key(&mut self, key: KeyEvent) {
+        if let Some(vim) = &mut self.vim_session {
+            vim.send_key(key);
+            return;
+        }
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('e' | 'i') if self.selected_summary().is_some() => {
+                self.open_selected_in_vim();
             }
+            KeyCode::Esc | KeyCode::Tab | KeyCode::Char('h') | KeyCode::Left => {
+                if !self.left_panel_visible {
+                    self.left_panel_visible = true;
+                }
+                self.focus = FocusTarget::LeftTitles;
+            }
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') => self.modal = ModalState::Help,
+            KeyCode::Char('p') if !ctrl => self.open_preferences_modal(),
+            KeyCode::Char('b') => self.toggle_left_panel(),
+            KeyCode::Char('/') => self.focus = FocusTarget::SearchInput,
+            KeyCode::Char('t') => self.open_tag_modal(),
+            KeyCode::Char('n') => self.open_notebook_modal(),
+            KeyCode::Char('r') if !ctrl => self.open_rename_modal(),
+            KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_preview(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_preview(-1),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_preview(12),
+            KeyCode::PageUp => self.scroll_preview(-12),
+            KeyCode::Char('d') if ctrl => self.scroll_preview(10),
+            KeyCode::Char('u') if ctrl => self.scroll_preview(-10),
+            KeyCode::Char('g') | KeyCode::Home => self.preview_scroll = 0,
+            KeyCode::Char('G') | KeyCode::End => self.scroll_preview(i16::MAX),
+            _ => {}
         }
     }
 
@@ -946,6 +1097,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.modal = ModalState::Help,
+            KeyCode::Char('p') if !ctrl => self.open_preferences_modal(),
             KeyCode::Char('b') => self.toggle_left_panel(),
             KeyCode::Char('/') => self.focus = FocusTarget::SearchInput,
             KeyCode::Char('t') => self.open_tag_modal(),
@@ -956,18 +1108,20 @@ impl App {
             KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::PageDown => self.scroll_preview(12),
+            KeyCode::PageUp => self.scroll_preview(-12),
+            KeyCode::Char('d') if ctrl => self.scroll_preview(10),
+            KeyCode::Char('u') if ctrl => self.scroll_preview(-10),
             KeyCode::Char('g') | KeyCode::Home => self.set_selection(0),
             KeyCode::Char('G') | KeyCode::End => {
                 if !self.notes.is_empty() {
                     self.set_selection(self.notes.len() - 1);
                 }
             }
-            KeyCode::Enter
-            | KeyCode::Tab
-            | KeyCode::Char('l')
-            | KeyCode::Char('e')
-            | KeyCode::Char('i')
-            | KeyCode::Right
+            KeyCode::Enter | KeyCode::Char('e' | 'i') if self.selected_summary().is_some() => {
+                self.open_selected_in_vim();
+            }
+            KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right
                 if self.selected_summary().is_some() =>
             {
                 self.focus = FocusTarget::RightVim;
@@ -1019,6 +1173,26 @@ impl App {
                     self.modal = ModalState::Help;
                 }
             }
+            ModalState::Preferences(mut pm) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q' | 'p') | KeyCode::F(7) => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    pm.cursor = pm.cursor.saturating_sub(1);
+                    self.modal = ModalState::Preferences(pm);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if pm.cursor + 1 < PREFERENCES_ITEMS_COUNT {
+                        pm.cursor += 1;
+                    }
+                    self.modal = ModalState::Preferences(pm);
+                }
+                KeyCode::Char(' ') | KeyCode::Enter => {
+                    self.toggle_preference_at(pm.cursor);
+                    self.modal = ModalState::Preferences(pm);
+                }
+                _ => {
+                    self.modal = ModalState::Preferences(pm);
+                }
+            },
             ModalState::TagEditor(mut tm) => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 let rows = tm.visible_rows(&self.tags);
@@ -1273,6 +1447,8 @@ impl App {
                     let vim_area = self.geometry.vim_area;
                     if let Some(vim) = &mut self.vim_session {
                         vim.send_mouse(mouse, vim_area);
+                    } else {
+                        self.scroll_preview(-3);
                     }
                 }
             }
@@ -1287,6 +1463,8 @@ impl App {
                     let vim_area = self.geometry.vim_area;
                     if let Some(vim) = &mut self.vim_session {
                         vim.send_mouse(mouse, vim_area);
+                    } else {
+                        self.scroll_preview(3);
                     }
                 }
             }
@@ -1305,6 +1483,17 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 if !rect_contains(inner, col, row) {
                     self.modal = ModalState::None;
+                    return;
+                }
+                if let ModalState::Preferences(mut pm) = self.modal {
+                    if row > inner.y {
+                        let clicked_idx = usize::from(row - (inner.y + 1));
+                        if clicked_idx < PREFERENCES_ITEMS_COUNT {
+                            pm.cursor = clicked_idx;
+                            self.toggle_preference_at(clicked_idx);
+                            self.modal = ModalState::Preferences(pm);
+                        }
+                    }
                     return;
                 }
                 // List rows inside TagEditor / NotebookPicker begin at inner.y + 3
@@ -1470,5 +1659,34 @@ mod tests {
 
         app.toggle_left_panel();
         assert!(app.left_panel_visible);
+    }
+
+    #[test]
+    fn preferences_modal_toggles_and_persists_vim_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefs_file = dir.path().join("preferences.conf");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::with_preferences(tx, Preferences::default(), Some(prefs_file.clone()));
+        assert!(!app.preferences.vim_preview);
+
+        // Press `p` -> open Preferences, `Space` -> check "Vim preview", `p` -> close.
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::empty(),
+        )));
+        assert!(matches!(app.modal, ModalState::Preferences(_)));
+
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::empty(),
+        )));
+        assert!(app.preferences.vim_preview);
+        assert!(Preferences::load_or_default(&prefs_file).vim_preview);
+
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::empty(),
+        )));
+        assert!(matches!(app.modal, ModalState::None));
     }
 }

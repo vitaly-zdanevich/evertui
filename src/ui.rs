@@ -1,6 +1,6 @@
 use crate::app::{
-    App, FocusTarget, LayoutGeometry, ModalState, NotebookPickerModal, PromptKind, SaveIndicator,
-    TagEditorModal, TagModalRow, TextPromptModal,
+    App, FocusTarget, LayoutGeometry, ModalState, NotebookPickerModal, PreferencesModal,
+    PromptKind, SaveIndicator, TagEditorModal, TagModalRow, TextPromptModal,
 };
 use crate::domain::{LeftPanelWidthCols, MAX_LEFT_TITLES};
 use crate::search::ParsedSearch;
@@ -9,7 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 const ASCII_BORDER: border::Set<'static> = border::Set {
@@ -388,10 +388,11 @@ fn render_right_note_panel(
     } else {
         Color::DarkGray
     };
-    let pane_title = if focused {
-        " Note | VIM (:w saves to Evernote) "
-    } else {
-        " Note (Enter/Click to edit in Vim) "
+    let pane_title = match (app.vim_session.is_some(), focused) {
+        (true, true) => " Note | VIM (:w saves to Evernote, :q closes editor) ",
+        (true, false) => " Note | VIM preview (Enter/Click to edit in Vim) ",
+        (false, true) => " Note | Text Preview (j/k scroll, Enter to edit in Vim) ",
+        (false, false) => " Note | Text Preview (Enter to edit in Vim) ",
     };
 
     let borders = if app.left_panel_visible {
@@ -440,6 +441,46 @@ fn render_right_note_panel(
         {
             frame.set_cursor_position((cx, cy));
         }
+    } else if let Some(preview_md) = app.selected_preview_text() {
+        let lines: Vec<Line<'_>> = if preview_md.is_empty() {
+            vec![Line::from(Span::styled(
+                " (Empty note - press Enter to edit in Vim)",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            preview_md
+                .lines()
+                .map(|line| {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("[Image: ") || trimmed.starts_with("[Attachment: ") {
+                        Line::from(Span::styled(
+                            format!(" {line}"),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                    } else if trimmed.starts_with('#') {
+                        Line::from(Span::styled(
+                            format!(" {line}"),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        Line::from(Span::styled(
+                            format!(" {line}"),
+                            Style::default().fg(Color::White),
+                        ))
+                    }
+                })
+                .collect()
+        };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((app.preview_scroll, 0)),
+            sections[1],
+        );
     } else if app.loading_note_guid.is_some() {
         let sp = SPINNER_FRAMES[app.anim_tick % SPINNER_FRAMES.len()];
         frame.render_widget(
@@ -605,15 +646,21 @@ fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
             " Up/Down:Select | Type:Filter notebooks | Enter:Set notebook | Esc:Cancel"
         }
         (ModalState::TextPrompt(_), _) => " Enter:Confirm | Ctrl+U:Clear | Esc:Cancel",
+        (ModalState::Preferences(_), _) => {
+            " Space/Enter:Toggle checkbox | Up/Down:Select | Esc/p/q:Close preferences"
+        }
         (ModalState::Help, _) => " Esc / Enter / q:Close help",
         (ModalState::None, FocusTarget::LeftTitles) => {
-            " j/k:Select  Enter/Tab:Vim  /:Search  t:Tags  n:Notebook  r:Rename  c:New  b/F2:Hide Left  ?:Help  q:Quit"
+            " j/k:Select  Enter:Edit in Vim  /:Search  t:Tags  n:Notebook  r:Rename  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
         }
         (ModalState::None, FocusTarget::SearchInput) => {
             " Enter:Run search | Syntax: tag:x  notebook:y  t:x  n:y  \"t x\"  \"n y\" | Ctrl+U:Clear | Esc:Back"
         }
+        (ModalState::None, FocusTarget::RightVim) if app.vim_session.is_none() => {
+            " j/k/PgUp/PgDn:Scroll  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  q:Quit"
+        }
         (ModalState::None, FocusTarget::RightVim) => {
-            " :w:Save to Evernote | Ctrl+\\ / Alt+h:Titles | F2/Alt+b:Toggle Left | F3:Search | F4:Tags | F5:Notebook | Drag |:Resize"
+            " :w:Save to Evernote | :q:Close Vim | Ctrl+\\ / Alt+h:Titles | F2:Toggle Left | F4:Tags | F5:Notebook | F7:Prefs"
         }
     };
 
@@ -631,6 +678,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, area: Rect, geom: &mut LayoutG
         ModalState::TagEditor(tm) => render_tag_modal(frame, app, tm, area, geom),
         ModalState::NotebookPicker(nm) => render_notebook_modal(frame, app, nm, area, geom),
         ModalState::TextPrompt(pm) => render_prompt_modal(frame, pm, area, geom),
+        ModalState::Preferences(pm) => render_preferences_modal(frame, app, pm, area, geom),
         ModalState::Help => render_help_modal(frame, area, geom),
     }
 }
@@ -915,8 +963,92 @@ fn render_prompt_modal(
     }
 }
 
+fn render_preferences_modal(
+    frame: &mut Frame<'_>,
+    app: &App,
+    pm: &PreferencesModal,
+    area: Rect,
+    geom: &mut LayoutGeometry,
+) {
+    let popup = centered_rect(area, 68, 10);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Preferences (p) ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_set(ASCII_BORDER)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black));
+
+    let inner = block.inner(popup);
+    geom.modal_inner = Some(inner);
+    frame.render_widget(block, popup);
+
+    if inner.height < 4 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new("Space / Enter toggles option (saved automatically):")
+            .style(Style::default().fg(Color::Gray)),
+        chunks[0],
+    );
+
+    let checked_span = if app.preferences.vim_preview {
+        Span::styled(" [x] ", Style::default().fg(Color::Green))
+    } else {
+        Span::styled(" [ ] ", Style::default().fg(Color::DarkGray))
+    };
+    let items = vec![ListItem::new(Line::from(vec![
+        checked_span,
+        Span::raw("Vim preview"),
+    ]))];
+    let mut state = ListState::default();
+    state.select(Some(pm.cursor.min(items.len().saturating_sub(1))));
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, chunks[1], &mut state);
+
+    frame.render_widget(
+        Paragraph::new("-".repeat(usize::from(chunks[2].width)))
+            .style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+
+    let desc = vec![
+        Line::from(Span::styled(
+            "Unchecked (default): fast text preview; press Enter to edit in Vim.",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::from(Span::styled(
+            "Checked: open every selected note directly in embedded Vim.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(desc), chunks[3]);
+}
+
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometry) {
-    let popup = centered_rect(area, 72, 21);
+    let popup = centered_rect(area, 72, 22);
     frame.render_widget(Clear, popup);
 
     let block = Block::default()
@@ -951,8 +1083,10 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("  * j / k / Up / Down / Click  Select note"),
-        Line::from("  * Enter / Tab / l / e        Focus embedded real Vim"),
+        Line::from("  * j / k / Up / Down / Click  Select note (fast text preview)"),
+        Line::from("  * Enter / e / i              Replace preview with embedded Vim"),
+        Line::from("  * Tab / l / PgUp / PgDn      Focus or scroll text preview"),
+        Line::from("  * p (or F7 / Alt+p)          Preferences (\"Vim preview\" toggle)"),
         Line::from("  * t (or F4 / Alt+t)          Add / remove tags on note"),
         Line::from("  * n (or F5 / Alt+n)          Change note's notebook"),
         Line::from("  * r (or F6 / Alt+r)          Rename note title"),
@@ -966,7 +1100,7 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from("  * :w                         Save buffer directly to Evernote"),
-        Line::from("  * :q / :wq                   Return focus to Left Panel"),
+        Line::from("  * :q / :wq                   Close Vim & return to preview"),
         Line::from("  * Ctrl+\\ or Alt+h            Switch focus to Left Panel"),
         Line::from("  * Drag vertical | border     Resize panels live with mouse"),
     ];
@@ -1086,7 +1220,15 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
 
-        let buf = terminal.backend().buffer();
+        assert_pure_ascii_and_ansi16(terminal.backend().buffer());
+
+        // Also verify Preferences modal renders strictly pure ASCII and ANSI-16 colors.
+        app.open_preferences_modal();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        assert_pure_ascii_and_ansi16(terminal.backend().buffer());
+    }
+
+    fn assert_pure_ascii_and_ansi16(buf: &ratatui::buffer::Buffer) {
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
                 let cell = &buf[(x, y)];

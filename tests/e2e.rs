@@ -240,11 +240,33 @@ fn full_tui_workflow_with_placeholders_search_tags_notebook_and_real_vim_save() 
 
     // 1. Left panel enforces 20 titles max.
     assert_eq!(app.notes.len(), 20);
-    // 2. Right panel renders Note Info + real Vim with image & file placeholders.
+    // 2. Default mode (`vim_preview == false`) renders fast native Text Preview without spawning Vim.
+    assert!(!app.preferences.vim_preview);
+    assert!(app.vim_session.is_none());
+    assert!(screen_text.contains("Text Preview"));
     assert!(screen_text.contains("INBOX"));
     assert!(screen_text.contains("#Evernote #tui"));
     assert!(screen_text.contains("[Image: wireframe.png]"));
     assert!(screen_text.contains("[Attachment: notes.pdf]"));
+
+    // 2b. Open Preferences with `p`, verify `[ ] Vim preview`, toggle on & off, close with Esc.
+    app.handle_terminal_event(key_press(KeyCode::Char('p')));
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    let prefs_screen = buffer_to_string(terminal.backend().buffer());
+    assert!(prefs_screen.contains("Preferences (p)"));
+    assert!(prefs_screen.contains("[ ] Vim preview"));
+
+    app.handle_terminal_event(key_press(KeyCode::Char(' ')));
+    assert!(app.preferences.vim_preview);
+    assert!(app.vim_session.is_some());
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    assert!(buffer_to_string(terminal.backend().buffer()).contains("[x] Vim preview"));
+
+    // Uncheck back to fast text preview default and close Preferences.
+    app.handle_terminal_event(key_press(KeyCode::Char(' ')));
+    assert!(!app.preferences.vim_preview);
+    assert!(app.vim_session.is_none());
+    app.handle_terminal_event(key_press(KeyCode::Esc));
 
     // 3. Search using space-separated aliases `t tui n INBOX`.
     app.handle_terminal_event(key_press(KeyCode::Char('/')));
@@ -338,21 +360,31 @@ fn full_tui_workflow_with_placeholders_search_tags_notebook_and_real_vim_save() 
     assert!(!app.left_panel_visible);
     terminal.draw(|f| ui::render(f, &mut app)).unwrap();
     assert!(app.geometry.separator_x.is_none());
+    assert!(app.vim_session.is_none());
 
-    // 7. Focus real Vim in right panel, edit & save with `:w`, verify ENML preserves <en-media> tags!
-    app.focus = FocusTarget::RightVim;
+    // 7. Press Enter to replace text preview with real embedded Vim, edit & `:wq`,
+    //    verify ENML preserves <en-media> tags and exiting Vim returns to fast text preview!
+    app.handle_terminal_event(key_press(KeyCode::Enter));
+    assert!(app.vim_session.is_some());
     if let Some(vim) = &mut app.vim_session {
-        vim.write_raw(b"GoEdited inside embedded vim!\x1b:w\r");
+        vim.write_raw(b"GoEdited inside embedded vim!\x1b:wq\r");
     }
 
     let vim_save_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < vim_save_deadline && calls.lock().unwrap().saved_contents.is_empty() {
+    while Instant::now() < vim_save_deadline
+        && (calls.lock().unwrap().saved_contents.is_empty() || app.vim_session.is_some())
+    {
         app.poll_vim_activity();
         while let Ok(evt) = backend.evt_rx.try_recv() {
             app.handle_worker_event(evt);
         }
         thread::sleep(Duration::from_millis(20));
     }
+
+    assert!(app.vim_session.is_none());
+    terminal.draw(|f| ui::render(f, &mut app)).unwrap();
+    let updated_preview = buffer_to_string(terminal.backend().buffer());
+    assert!(updated_preview.contains("Edited inside embedded vim!"));
 
     let saved = calls.lock().unwrap();
     assert_eq!(saved.saved_contents.len(), 1);

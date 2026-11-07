@@ -4,17 +4,21 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use rustix::fd::OwnedFd;
+use rustix::fs::{MemfdFlags, memfd_create};
+use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU16;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tempfile::TempDir;
+
+static SPAWN_INHERIT_LOCK: Mutex<()> = Mutex::new(());
 
 struct PtyCallbacks {
     writer: Arc<Mutex<File>>,
@@ -67,11 +71,13 @@ impl PtyCallbacks {
 }
 
 /// Manages an embedded real `vim` process running inside a Linux PTY and rendered via `vt100`.
+///
+/// Note content and save notifications live strictly in anonymous kernel RAM (`memfd_create`),
+/// never touching `/tmp` or writing swap, backup, undo, or viminfo files to disk.
 pub struct VimSession {
     pub note_guid: NoteGuid,
-    _temp_dir: TempDir,
-    note_file_path: PathBuf,
-    saves_log_path: PathBuf,
+    note_ram_file: File,
+    saves_seq_file: File,
     last_saves_len: u64,
     master_fd: OwnedFd,
     writer: Arc<Mutex<File>>,
@@ -95,19 +101,21 @@ impl VimSession {
         let nz_rows = NonZeroU16::new(rows).expect("clamped >= 2");
         let nz_cols = NonZeroU16::new(cols).expect("clamped >= 10");
 
-        let temp_dir = tempfile::Builder::new().prefix("evertui-vim-").tempdir()?;
-        let safe_id: String = note_guid
-            .as_str()
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .take(48)
-            .collect();
-        let file_stem = if safe_id.is_empty() { "note" } else { &safe_id };
-        let note_file_path = temp_dir.path().join(format!("{file_stem}.md"));
-        let saves_log_path = temp_dir.path().join("saves.log");
+        let buf_memfd =
+            memfd_create(c"evertui-note", MemfdFlags::CLOEXEC).map_err(io::Error::from)?;
+        let seq_memfd =
+            memfd_create(c"evertui-saves", MemfdFlags::CLOEXEC).map_err(io::Error::from)?;
 
-        fs::write(&note_file_path, initial_markdown)?;
-        fs::write(&saves_log_path, b"")?;
+        let mut note_ram_file = File::from(buf_memfd);
+        note_ram_file.write_all(initial_markdown.as_bytes())?;
+        note_ram_file.flush()?;
+
+        let saves_seq_file = File::from(seq_memfd);
+
+        let buf_raw_fd = note_ram_file.as_raw_fd();
+        let seq_raw_fd = saves_seq_file.as_raw_fd();
+        let ram_buf_proc_path = format!("/proc/self/fd/{buf_raw_fd}");
+        let ram_seq_proc_path = format!("/proc/self/fd/{seq_raw_fd}");
 
         let (master_fd, slave_fd) = open_pty_pair(rows, cols)?;
         let reader_fd = master_fd.try_clone()?;
@@ -126,8 +134,7 @@ impl VimSession {
         let basic_tty = is_basic_tty_term(outer_term.as_deref());
 
         let autocmd = format!(
-            "autocmd BufWritePost <buffer> silent! call writefile(['saved'], '{}', 'a')",
-            vim_single_quote(&saves_log_path)
+            "autocmd BufWritePost <buffer> silent! call writefile(['saved'], '{ram_seq_proc_path}', 'a')"
         );
 
         let mut cmd = if has_setsid() {
@@ -139,12 +146,18 @@ impl VimSession {
         };
 
         cmd.arg("-n")
+            .arg("-i")
+            .arg("NONE")
             .arg("--cmd")
-            .arg("set t_RV= t_u7= | let g:loaded_confirm_quit=1")
+            .arg("set nobackup nowritebackup noundofile noswapfile t_RV= t_u7= | let g:loaded_confirm_quit=1")
             .arg("-c")
-            .arg("set filetype=markdown")
+            .arg("setlocal nobackup nowritebackup noundofile noswapfile filetype=markdown")
             .arg("-c")
             .arg(&autocmd);
+
+        if let Some(ram_dir) = ram_tmpdir() {
+            cmd.env("TMPDIR", ram_dir);
+        }
 
         if basic_tty {
             cmd.arg("-c")
@@ -163,12 +176,22 @@ impl VimSession {
             }
         }
 
-        cmd.arg(&note_file_path)
+        cmd.arg(&ram_buf_proc_path)
             .stdin(Stdio::from(slave_in))
             .stdout(Stdio::from(slave_out))
             .stderr(Stdio::from(slave_err));
 
-        let child = cmd.spawn()?;
+        let child = {
+            let _guard = SPAWN_INHERIT_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            fcntl_setfd(&note_ram_file, FdFlags::empty()).map_err(io::Error::from)?;
+            fcntl_setfd(&saves_seq_file, FdFlags::empty()).map_err(io::Error::from)?;
+            let spawn_res = cmd.spawn();
+            let _ = fcntl_setfd(&note_ram_file, FdFlags::CLOEXEC);
+            let _ = fcntl_setfd(&saves_seq_file, FdFlags::CLOEXEC);
+            spawn_res?
+        };
 
         let writer = Arc::new(Mutex::new(File::from(writer_fd)));
         let callbacks = PtyCallbacks {
@@ -196,9 +219,8 @@ impl VimSession {
 
         Ok(Self {
             note_guid,
-            _temp_dir: temp_dir,
-            note_file_path,
-            saves_log_path,
+            note_ram_file,
+            saves_seq_file,
             last_saves_len: 0,
             master_fd,
             writer,
@@ -223,13 +245,15 @@ impl VimSession {
     }
 
     /// Checks whether Vim completed a `:w` (`BufWritePost`) since the last check.
-    /// If so, reads and returns the freshly written Markdown content.
+    /// If so, reads and returns the freshly written Markdown content from kernel RAM (`memfd`).
     pub fn poll_saved_markdown(&mut self) -> Option<String> {
-        let meta = fs::metadata(&self.saves_log_path).ok()?;
-        let len = meta.len();
+        let len = self.saves_seq_file.metadata().ok()?.len();
         if len > self.last_saves_len {
             self.last_saves_len = len;
-            fs::read_to_string(&self.note_file_path).ok()
+            self.note_ram_file.seek(SeekFrom::Start(0)).ok()?;
+            let mut out = String::new();
+            self.note_ram_file.read_to_string(&mut out).ok()?;
+            Some(out)
         } else {
             None
         }
@@ -416,15 +440,24 @@ fn has_setsid() -> bool {
     Path::new("/usr/bin/setsid").is_file() || Path::new("/bin/setsid").is_file()
 }
 
+fn ram_tmpdir() -> Option<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
+        && xdg.is_dir()
+    {
+        return Some(xdg);
+    }
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir() {
+        return Some(shm.to_path_buf());
+    }
+    None
+}
+
 fn is_basic_tty_term(term: Option<&str>) -> bool {
     match term.map(str::trim) {
         None | Some("" | "linux" | "dumb") => true,
         Some(t) => t.starts_with("vt"),
     }
-}
-
-fn vim_single_quote(path: &Path) -> String {
-    path.to_string_lossy().replace('\'', "''")
 }
 
 fn cell_to_style(cell: &vt100::Cell, basic_tty: bool) -> Style {
@@ -642,42 +675,88 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn spawns_real_vim_edits_and_detects_colon_w_save() {
-        let mut session =
-            VimSession::spawn(NoteGuid::from("test-guid-123"), "Initial line\n", 24, 80)
-                .expect("should spawn vim in PTY");
+    fn spawns_real_vim_in_ram_memfd_without_tmp_files_and_detects_saves() {
+        let mut session = VimSession::spawn(
+            NoteGuid::from("test-guid-123"),
+            "Initial very long line in RAM only\nSecond line\n",
+            24,
+            80,
+        )
+        .expect("should spawn vim in PTY backed by RAM memfd");
 
         // Wait until Vim renders initial content into the vt100 screen.
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             session.drain_output();
-            if session.parser.screen().contents().contains("Initial line") {
+            if session
+                .parser
+                .screen()
+                .contents()
+                .contains("Initial very long line in RAM only")
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            session.parser.screen().contents().contains("Initial line"),
+            session
+                .parser
+                .screen()
+                .contents()
+                .contains("Initial very long line in RAM only"),
             "Vim screen should display initial markdown"
         );
 
-        // Append a new line in Vim and execute `:w`
+        // Verify via /proc/<pid>/fd that the child holds anonymous memfd inodes and zero /tmp files.
+        let proc_fd_dir = format!("/proc/{}/fd", session.child.id());
+        if let Ok(entries) = std::fs::read_dir(&proc_fd_dir) {
+            let mut saw_memfd = false;
+            for entry in entries.flatten() {
+                if let Ok(target) = std::fs::read_link(entry.path()) {
+                    let s = target.to_string_lossy();
+                    assert!(
+                        !s.starts_with("/tmp/") && !s.starts_with("/var/tmp/"),
+                        "Expected zero /tmp files, found fd pointing to {s}"
+                    );
+                    if s.contains("memfd:evertui-") {
+                        saw_memfd = true;
+                    }
+                }
+            }
+            assert!(saw_memfd, "Child descriptors must include anonymous memfd");
+        }
+
+        // 1st save: append a line and execute `:w`
         session.write_raw(b"GoSaved from real vim\x1b:w\r");
 
-        let mut saved_text = None;
+        let mut first_save = None;
         let save_deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < save_deadline {
             session.drain_output();
             if let Some(md) = session.poll_saved_markdown() {
-                saved_text = Some(md);
+                first_save = Some(md);
                 break;
             }
             thread::sleep(Duration::from_millis(20));
         }
 
-        let md = saved_text.expect("`:w` in Vim should trigger BufWritePost save detection");
-        assert!(md.contains("Initial line"));
-        assert!(md.contains("Saved from real vim"));
+        let md1 = first_save.expect("`:w` in Vim should trigger BufWritePost save detection");
+        assert!(md1.contains("Initial very long line in RAM only"));
+        assert!(md1.contains("Saved from real vim"));
+
+        // 2nd save: replace entire buffer with shorter content to verify in-RAM truncation on `:w`
+        session.write_raw(b"ggdGiShort RAM note\x1b:w\r");
+        let mut second_save = None;
+        let save2_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < save2_deadline {
+            session.drain_output();
+            if let Some(md) = session.poll_saved_markdown() {
+                second_save = Some(md);
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(second_save.as_deref(), Some("Short RAM note\n"));
 
         // Quit Vim with `:q`
         session.write_raw(b":q\r");

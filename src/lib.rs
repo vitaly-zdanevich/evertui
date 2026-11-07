@@ -3,6 +3,7 @@ pub mod auth;
 pub mod domain;
 pub mod enml;
 pub mod evernote_api;
+pub mod preferences;
 pub mod search;
 pub mod ui;
 pub mod vim_pane;
