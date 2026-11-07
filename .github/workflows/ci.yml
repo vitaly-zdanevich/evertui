@@ -17,6 +17,15 @@ env:
   RUST_TOOLCHAIN: 1.94.0
 
 jobs:
+  badges:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test badge counter
+        run: python3 -m unittest discover -s tools -p 'test_*.py' -v
+      - name: Check README code badges are up to date
+        run: python3 tools/code_badges.py --check
+
   fmt:
     runs-on: ubuntu-24.04
     steps:

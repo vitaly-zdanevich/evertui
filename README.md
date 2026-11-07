@@ -1,5 +1,8 @@
 # evertui
 
+[![Production code](docs/badges/production-code.svg)](src)
+[![Test code](docs/badges/test-code.svg)](tests)
+
 Two-panel Evernote TUI written in Rust with embedded real `vim` in the right panel.
 Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux virtual consoles (`/dev/tty*`, `TERM=linux`) as well as modern terminal emulators.
 
