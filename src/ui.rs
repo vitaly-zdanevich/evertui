@@ -7,21 +7,9 @@ use crate::search::ParsedSearch;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
-
-const ASCII_BORDER: border::Set<'static> = border::Set {
-    top_left: "+",
-    top_right: "+",
-    bottom_left: "+",
-    bottom_right: "+",
-    vertical_left: "|",
-    vertical_right: "|",
-    horizontal_top: "-",
-    horizontal_bottom: "-",
-};
 
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const BAR_FRAMES: &[&str] = &[
@@ -248,7 +236,7 @@ fn render_main_split(frame: &mut Frame<'_>, app: &mut App, area: Rect, geom: &mu
             .split(area);
 
         render_left_titles_panel(frame, app, panes[0], geom);
-        render_vertical_separator(frame, app, panes[1], geom);
+        geom.separator_x = Some(panes[1].x);
         render_right_note_panel(frame, app, panes[2], geom);
     } else {
         geom.left_titles_inner = None;
@@ -264,26 +252,7 @@ fn render_left_titles_panel(
     geom: &mut LayoutGeometry,
 ) {
     let focused = app.focus == FocusTarget::LeftTitles;
-    let border_color = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let title = format!(" Notes ({}/{MAX_LEFT_TITLES}) ", app.notes.len());
-    let block = Block::default()
-        .title(Span::styled(
-            title,
-            Style::default()
-                .fg(if focused { Color::Cyan } else { Color::Gray })
-                .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::TOP | Borders::BOTTOM | Borders::LEFT)
-        .border_set(ASCII_BORDER)
-        .border_style(Style::default().fg(border_color));
-
-    let inner = block.inner(area);
-    geom.left_titles_inner = Some(inner);
-    frame.render_widget(block, area);
+    geom.left_titles_inner = Some(area);
 
     if app.notes.is_empty() {
         let msg = if app.loading_list {
@@ -293,12 +262,12 @@ fn render_left_titles_panel(
         };
         frame.render_widget(
             Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
-            inner,
+            area,
         );
         return;
     }
 
-    let max_title_cols = usize::from(inner.width);
+    let max_title_cols = usize::from(area.width);
     let items: Vec<ListItem<'_>> = app
         .notes
         .iter()
@@ -328,39 +297,7 @@ fn render_left_titles_panel(
     let mut state = ListState::default();
     state.select(Some(app.selected_index));
     let list = List::new(items).highlight_style(highlight_style);
-    frame.render_stateful_widget(list, inner, &mut state);
-}
-
-fn render_vertical_separator(
-    frame: &mut Frame<'_>,
-    app: &App,
-    area: Rect,
-    geom: &mut LayoutGeometry,
-) {
-    geom.separator_x = Some(area.x);
-    let glyph = if app.dragging_separator { "#" } else { "|" };
-    let style = if app.dragging_separator {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if app.focus == FocusTarget::LeftTitles || app.focus == FocusTarget::RightVim {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-
-    let buf = frame.buffer_mut();
-    let top = area.y;
-    let bottom = area.y.saturating_add(area.height.saturating_sub(1));
-    let mid = area.y + area.height / 2;
-    for y in area.y..area.y.saturating_add(area.height) {
-        let sym = if y == top || y == bottom || y == mid {
-            "+"
-        } else {
-            glyph
-        };
-        buf[(area.x, y)].set_symbol(sym).set_style(style);
-    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_right_note_panel(
@@ -370,33 +307,16 @@ fn render_right_note_panel(
     geom: &mut LayoutGeometry,
 ) {
     let focused = app.focus == FocusTarget::RightVim;
-    let border_color = if focused {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let borders = if app.left_panel_visible {
-        Borders::BOTTOM | Borders::RIGHT
-    } else {
-        Borders::BOTTOM | Borders::LEFT | Borders::RIGHT
-    };
+    let inner = area;
 
-    let block = Block::default()
-        .borders(borders)
-        .border_set(ASCII_BORDER)
-        .border_style(Style::default().fg(border_color));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height < 5 || inner.width < 10 {
+    if inner.height < 4 || inner.width < 10 {
         geom.vim_area = inner;
         return;
     }
 
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(2)])
+        .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(inner);
 
     render_note_metadata_header(frame, app, sections[0], geom);
@@ -601,12 +521,8 @@ fn render_note_metadata_header(
         Span::styled(extra_str, Style::default().fg(Color::DarkGray)),
     ]);
 
-    // Row 3: Pure ASCII horizontal rule
-    let rule = "-".repeat(usize::from(area.width));
-    let line_rule = Line::from(Span::styled(rule, Style::default().fg(Color::DarkGray)));
-
     frame.render_widget(
-        Paragraph::new(vec![line_title, line_nb_tags, line_dates, line_rule]),
+        Paragraph::new(vec![line_title, line_nb_tags, line_dates]),
         area,
     );
 }
@@ -648,13 +564,49 @@ fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn render_modal(frame: &mut Frame<'_>, app: &App, area: Rect, geom: &mut LayoutGeometry) {
     match &app.modal {
-        ModalState::None => geom.modal_inner = None,
+        ModalState::None => {
+            geom.modal_area = None;
+            geom.modal_inner = None;
+        }
         ModalState::TagEditor(tm) => render_tag_modal(frame, app, tm, area, geom),
         ModalState::NotebookPicker(nm) => render_notebook_modal(frame, app, nm, area, geom),
         ModalState::TextPrompt(pm) => render_prompt_modal(frame, pm, area, geom),
         ModalState::Preferences(pm) => render_preferences_modal(frame, app, pm, area, geom),
         ModalState::Help => render_help_modal(frame, area, geom),
     }
+}
+
+fn render_modal_surface(
+    frame: &mut Frame<'_>,
+    popup: Rect,
+    title: Span<'_>,
+    geom: &mut LayoutGeometry,
+) -> Rect {
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        popup,
+    );
+    let inner = Rect {
+        x: popup.x.saturating_add(1),
+        y: popup.y.saturating_add(1),
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    };
+    if popup.height >= 1 && inner.width >= 1 {
+        frame.render_widget(
+            Paragraph::new(Line::from(title)).style(Style::default().bg(Color::Black)),
+            Rect {
+                x: inner.x,
+                y: popup.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    }
+    geom.modal_area = Some(popup);
+    geom.modal_inner = Some(inner);
+    inner
 }
 
 fn render_tag_modal(
@@ -664,36 +616,26 @@ fn render_tag_modal(
     area: Rect,
     geom: &mut LayoutGeometry,
 ) {
-    let popup = centered_rect(area, 62, 18);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(Span::styled(
-            format!(
-                " Manage Tags - {} ",
-                truncate_ascii_dots(&tm.note_title, 34)
-            ),
+    let popup = centered_rect(area, 62, 16);
+    let inner = render_modal_surface(
+        frame,
+        popup,
+        Span::styled(
+            format!("Manage Tags - {}", truncate_ascii_dots(&tm.note_title, 36)),
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER)
-        .border_style(Style::default().fg(Color::Green))
-        .style(Style::default().bg(Color::Black));
+        ),
+        geom,
+    );
 
-    let inner = block.inner(popup);
-    geom.modal_inner = Some(inner);
-    frame.render_widget(block, popup);
-
-    if inner.height < 4 {
+    if inner.height < 3 {
         return;
     }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
@@ -737,12 +679,6 @@ fn render_tag_modal(
         tm.filter.cursor_chars,
     );
 
-    frame.render_widget(
-        Paragraph::new("-".repeat(usize::from(chunks[2].width)))
-            .style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
-    );
-
     let rows = tm.visible_rows(&app.tags);
     let items: Vec<ListItem<'_>> = rows
         .iter()
@@ -777,7 +713,7 @@ fn render_tag_modal(
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
-    frame.render_stateful_widget(list, chunks[3], &mut state);
+    frame.render_stateful_widget(list, chunks[2], &mut state);
 }
 
 fn render_notebook_modal(
@@ -787,36 +723,26 @@ fn render_notebook_modal(
     area: Rect,
     geom: &mut LayoutGeometry,
 ) {
-    let popup = centered_rect(area, 58, 18);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(Span::styled(
-            format!(
-                " Set Notebook - {} ",
-                truncate_ascii_dots(&nm.note_title, 32)
-            ),
+    let popup = centered_rect(area, 58, 16);
+    let inner = render_modal_surface(
+        frame,
+        popup,
+        Span::styled(
+            format!("Set Notebook - {}", truncate_ascii_dots(&nm.note_title, 34)),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+        ),
+        geom,
+    );
 
-    let inner = block.inner(popup);
-    geom.modal_inner = Some(inner);
-    frame.render_widget(block, popup);
-
-    if inner.height < 4 {
+    if inner.height < 3 {
         return;
     }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
@@ -843,12 +769,6 @@ fn render_notebook_modal(
         prompt,
         &nm.filter.text,
         nm.filter.cursor_chars,
-    );
-
-    frame.render_widget(
-        Paragraph::new("-".repeat(usize::from(chunks[2].width)))
-            .style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
     );
 
     let filtered = nm.filtered(&app.notebooks);
@@ -885,7 +805,7 @@ fn render_notebook_modal(
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
-    frame.render_stateful_widget(list, chunks[3], &mut state);
+    frame.render_stateful_widget(list, chunks[2], &mut state);
 }
 
 fn render_prompt_modal(
@@ -894,34 +814,28 @@ fn render_prompt_modal(
     area: Rect,
     geom: &mut LayoutGeometry,
 ) {
-    let popup = centered_rect(area, 56, 5);
-    frame.render_widget(Clear, popup);
-
+    let popup = centered_rect(area, 56, 4);
     let title = match pm.kind {
-        PromptKind::RenameNote => " Rename Note Title ",
-        PromptKind::CreateNote => " Create New Note ",
+        PromptKind::RenameNote => "Rename Note Title",
+        PromptKind::CreateNote => "Create New Note",
     };
 
-    let block = Block::default()
-        .title(Span::styled(
+    let inner = render_modal_surface(
+        frame,
+        popup,
+        Span::styled(
             title,
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Style::default().bg(Color::Black));
+        ),
+        geom,
+    );
 
-    let inner = block.inner(popup);
-    geom.modal_inner = Some(inner);
-    frame.render_widget(block, popup);
-
-    if inner.height >= 2 {
+    if inner.height >= 1 {
         let row = Rect {
             x: inner.x,
-            y: inner.y + 1,
+            y: inner.y,
             width: inner.width,
             height: 1,
         };
@@ -944,26 +858,20 @@ fn render_preferences_modal(
     area: Rect,
     geom: &mut LayoutGeometry,
 ) {
-    let popup = centered_rect(area, 68, 10);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(Span::styled(
-            " Preferences (p) ",
+    let popup = centered_rect(area, 68, 8);
+    let inner = render_modal_surface(
+        frame,
+        popup,
+        Span::styled(
+            "Preferences (p)",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
+        ),
+        geom,
+    );
 
-    let inner = block.inner(popup);
-    geom.modal_inner = Some(inner);
-    frame.render_widget(block, popup);
-
-    if inner.height < 4 {
+    if inner.height < 3 {
         return;
     }
 
@@ -971,7 +879,6 @@ fn render_preferences_modal(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(2),
             Constraint::Length(1),
             Constraint::Min(1),
         ])
@@ -1002,12 +909,6 @@ fn render_preferences_modal(
     );
     frame.render_stateful_widget(list, chunks[1], &mut state);
 
-    frame.render_widget(
-        Paragraph::new("-".repeat(usize::from(chunks[2].width)))
-            .style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
-    );
-
     let desc = vec![
         Line::from(Span::styled(
             "Unchecked (default): fast text preview; press Enter to edit in Vim.",
@@ -1018,28 +919,22 @@ fn render_preferences_modal(
             Style::default().fg(Color::DarkGray),
         )),
     ];
-    frame.render_widget(Paragraph::new(desc), chunks[3]);
+    frame.render_widget(Paragraph::new(desc), chunks[2]);
 }
 
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometry) {
-    let popup = centered_rect(area, 72, 22);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(Span::styled(
-            " evertui Help ",
+    let popup = centered_rect(area, 72, 20);
+    let inner = render_modal_surface(
+        frame,
+        popup,
+        Span::styled(
+            "evertui Help",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-        ))
-        .borders(Borders::ALL)
-        .border_set(ASCII_BORDER)
-        .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black));
-
-    let inner = block.inner(popup);
-    geom.modal_inner = Some(inner);
-    frame.render_widget(block, popup);
+        ),
+        geom,
+    );
 
     let lines = vec![
         Line::from(Span::styled(
@@ -1076,7 +971,7 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
         Line::from("  * :w                         Save buffer directly to Evernote"),
         Line::from("  * :q / :wq                   Close Vim & return to preview"),
         Line::from("  * Ctrl+\\ or Alt+h            Switch focus to Left Panel"),
-        Line::from("  * Drag vertical | border     Resize panels live with mouse"),
+        Line::from("  * Drag seam between panels   Resize panels live with mouse"),
     ];
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -1247,6 +1142,77 @@ mod tests {
             .collect();
         assert!(row0.starts_with("Alpha title"), "unexpected row0: {row0:?}");
         assert!(row1.starts_with("Beta title"), "unexpected row1: {row1:?}");
+    }
+
+    #[test]
+    fn renders_borderless_layout_saving_space_and_photons() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::Bootstrapped {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![NoteSummary {
+                    guid: "g1".into(),
+                    title: "Clean Note".to_owned(),
+                    created: None,
+                    updated: None,
+                    notebook_guid: None,
+                    tag_guids: Vec::new(),
+                    content_length: Some(64),
+                }],
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        // Left panel starts flush at (0, 1) with full split height (rows 1..19 => 18 rows).
+        let left_inner = app.geometry.left_titles_inner.expect("left panel visible");
+        assert_eq!(left_inner.x, 0);
+        assert_eq!(left_inner.y, 1);
+        assert_eq!(left_inner.height, 18);
+
+        // Right panel metadata starts at y=1 and body (`vim_area`) starts at y=4 (no rule row).
+        assert_eq!(app.geometry.title_hit.y, 1);
+        assert_eq!(app.geometry.vim_area.y, 4);
+
+        // Vertical separator column is blank space (no `|` or `+` border glyphs).
+        let sep_x = app.geometry.separator_x.expect("separator hit-zone exists");
+        let buf = terminal.backend().buffer();
+        for y in 1..19 {
+            assert_eq!(
+                buf[(sep_x, y)].symbol(),
+                " ",
+                "unexpected border glyph at separator ({sep_x}, {y})"
+            );
+        }
+
+        // No `+---` box borders or `----` horizontal rules anywhere on screen or in modals.
+        let mut screen = String::new();
+        for y in 0..20 {
+            for x in 0..100 {
+                screen.push_str(buf[(x, y)].symbol());
+            }
+            screen.push('\n');
+        }
+        assert!(!screen.contains("+---"));
+        assert!(!screen.contains("----"));
+
+        app.open_preferences_modal();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mut modal_screen = String::new();
+        for y in 0..20 {
+            for x in 0..100 {
+                modal_screen.push_str(buf[(x, y)].symbol());
+            }
+            modal_screen.push('\n');
+        }
+        assert!(modal_screen.contains("Preferences (p)"));
+        assert!(!modal_screen.contains("+---"));
+        assert!(!modal_screen.contains("----"));
     }
 
     fn assert_pure_ascii_and_ansi16(buf: &ratatui::buffer::Buffer) {

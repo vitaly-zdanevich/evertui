@@ -16,7 +16,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
   - `[ ] Vim preview` (unchecked by default for instant browsing; check to preview every selected note directly in embedded `vim`, saved in `~/.config/evertui/preferences.conf`).
 - **Note content strictly in RAM (performance & security)**: Note previews, embedded `vim` buffers, and `:w` save notifications live exclusively in memory (using anonymous Linux kernel `memfd_create` descriptors with swap, backup, undo, and `viminfo` disabled, plus `TMPDIR` pointed at RAM `tmpfs`), so note text never touches `/tmp` or disk.
 - **Placeholders for media & attachments**: Images render as `[Image: filename.ext]` and files as `[Attachment: filename.ext]`, round-tripping safely back to `<en-media>` on `:w`.
-- **TTY-friendly pure ASCII UI**: Simple ASCII borders, spinners (`| / - \`), progress bar (`[==  ]`), and standard 16 ANSI colors (no emojis or wide Unicode symbols).
+- **TTY-friendly borderless pure ASCII UI**: Zero borders for maximum screen space and minimal visual noise, with ASCII spinners (`| / - \`), progress bar (`[==  ]`), and standard 16 ANSI colors (no emojis or wide Unicode symbols).
 - **Flexible search (`/`, `F3`, `Alt+s`)**:
   - `tag:something`, `notebook:something`
   - Aliases: `t:something`, `n:something`, `t something`, `n something`, `-t:something`, and quoted values (`t:"two words"`, `n "My Notebook"`).
@@ -24,7 +24,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
   - `t` (`F4` / `Alt+t` / click `[Tags: ...]`) to toggle existing tags or create new tags on a note.
   - `n` (`F5` / `Alt+n` / click `[Notebook: ...]`) to move a note to another notebook.
 - **Resizable & collapsible panels**:
-  - Drag the vertical `|` separator with the mouse to resize panels (resizing `vim`'s PTY live).
+  - Drag the seam between panels with the mouse to resize panels (resizing `vim`'s PTY live).
   - Press `b` / `F2` / `Alt+b` (or click `<< Hide` / `>> Titles`) to hide or show the left panel.
 - **Developer token auth**: Reads `--token`, `EVERTUI_DEV_TOKEN`, `EVERNOTE_DEV_TOKEN`, `~/.config/evertui/token`, or falls back to `~/.reeknote/reeknote.db`.
 

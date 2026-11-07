@@ -314,6 +314,7 @@ pub struct LayoutGeometry {
     pub notebook_hit: Rect,
     pub tags_hit: Rect,
     pub vim_area: Rect,
+    pub modal_area: Option<Rect>,
     pub modal_inner: Option<Rect>,
 }
 
@@ -1488,12 +1489,13 @@ impl App {
         let Some(inner) = self.geometry.modal_inner else {
             return;
         };
+        let modal_bounds = self.geometry.modal_area.unwrap_or(inner);
         let col = mouse.column;
         let row = mouse.row;
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if !rect_contains(inner, col, row) {
+                if !rect_contains(modal_bounds, col, row) {
                     self.modal = ModalState::None;
                     return;
                 }
@@ -1508,9 +1510,9 @@ impl App {
                     }
                     return;
                 }
-                // List rows inside TagEditor / NotebookPicker begin at inner.y + 3
-                if row >= inner.y + 3 {
-                    let clicked_row = usize::from(row - (inner.y + 3));
+                // List rows inside borderless TagEditor / NotebookPicker begin at inner.y + 2
+                if row >= inner.y + 2 {
+                    let clicked_row = usize::from(row - (inner.y + 2));
                     let modal = std::mem::take(&mut self.modal);
                     match modal {
                         ModalState::TagEditor(mut tm) => {
