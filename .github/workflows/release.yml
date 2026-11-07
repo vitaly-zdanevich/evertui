@@ -1,0 +1,158 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  RUST_TOOLCHAIN: 1.94.0
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - id: meta
+        run: |
+          tag="$RELEASE_TAG"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Check Cargo version
+        run: |
+          version="$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)"
+          test "$version" = "$RELEASE_TAG"
+
+  source:
+    needs: validate
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Build source archive
+        run: |
+          git archive --format=tar.gz --prefix="evertui-$RELEASE_TAG/" -o "evertui-$RELEASE_TAG.tar.gz" HEAD
+          sha256sum "evertui-$RELEASE_TAG.tar.gz" > "evertui-$RELEASE_TAG.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source
+          path: |
+            evertui-*.tar.gz
+            evertui-*.tar.gz.sha256
+
+  vendor:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - run: bash tools/build_vendor_archive.sh vendor.tar.gz
+      - run: |
+          tar -tzf vendor.tar.gz .cargo/config.toml >/dev/null
+          tar -tzf vendor.tar.gz vendor >/dev/null
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vendor
+          path: |
+            vendor.tar.gz
+            vendor.tar.gz.sha256
+
+  build-linux:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            rust_target: x86_64-unknown-linux-gnu
+            artifact_name: evertui-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-gnu
+            artifact_name: evertui-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add "${{ matrix.rust_target }}"
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+          key: release-cargo-build-${{ runner.os }}-${{ runner.arch }}-${{ matrix.rust_target }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --locked --release --bins --target "${{ matrix.rust_target }}"
+      - name: Pack binary
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.rust_target }}/release/evertui" dist/
+          tar -C dist -czf "${{ matrix.artifact_name }}.tar.gz" evertui
+          sha256sum "${{ matrix.artifact_name }}.tar.gz" > "${{ matrix.artifact_name }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.tar.gz.sha256
+
+  release:
+    needs:
+      - validate
+      - source
+      - vendor
+      - build-linux
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: List release assets
+        run: find release-assets -maxdepth 1 -type f -print | sort
+      - name: Create or update GitHub Release
+        run: |
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | sort)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --verify-tag \
+              --title "evertui $RELEASE_TAG" \
+              --notes "Release assets for evertui $RELEASE_TAG."
+          fi
