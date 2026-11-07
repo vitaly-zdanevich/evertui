@@ -20,3 +20,11 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
   - Drag the vertical `|` separator with the mouse to resize panels (resizing `vim`'s PTY live).
   - Press `b` / `F2` / `Alt+b` (or click `<< Hide` / `>> Titles`) to hide or show the left panel.
 - **Developer token auth**: Reads `--token`, `EVERTUI_DEV_TOKEN`, `EVERNOTE_DEV_TOKEN`, `~/.config/evertui/token`, or falls back to `~/.reeknote/reeknote.db`.
+
+## Gentoo install
+
+```sh
+eselect repository enable vitaly-zdanevich-overlay
+eselect sync --repo vitaly-zdanevich-overlay
+emerge -a evertui
+```
