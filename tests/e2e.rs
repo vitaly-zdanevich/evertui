@@ -247,10 +247,12 @@ fn full_tui_workflow_with_placeholders_search_tags_notebook_and_real_vim_save() 
     while let Ok(evt) = backend.evt_rx.try_recv() {
         app.handle_worker_event(evt);
     }
-    // 2. Default mode (`vim_preview == false`) renders fast native Text Preview without spawning Vim.
+    // 2. Default mode (`vim_preview == false`) renders fast native Text Preview without spawning Vim,
+    //    and places `Title:` directly below the top bar without a `"Note | Text Preview..."` row.
     assert!(!app.preferences.vim_preview);
     assert!(app.vim_session.is_none());
-    assert!(screen_text.contains("Text Preview"));
+    assert!(!screen_text.contains("Note | Text Preview"));
+    assert_eq!(app.geometry.title_hit.y, 1);
     assert!(screen_text.contains("INBOX"));
     assert!(screen_text.contains("#Evernote #tui"));
     assert!(screen_text.contains("[Image: wireframe.png]"));

@@ -375,26 +375,13 @@ fn render_right_note_panel(
     } else {
         Color::DarkGray
     };
-    let pane_title = match (app.vim_session.is_some(), focused) {
-        (true, true) => " Note | VIM (:w saves to Evernote, :q closes editor) ",
-        (true, false) => " Note | VIM preview (Enter/Click to edit in Vim) ",
-        (false, true) => " Note | Text Preview (j/k scroll, Enter to edit in Vim) ",
-        (false, false) => " Note | Text Preview (Enter to edit in Vim) ",
-    };
-
     let borders = if app.left_panel_visible {
-        Borders::TOP | Borders::BOTTOM | Borders::RIGHT
+        Borders::BOTTOM | Borders::RIGHT
     } else {
-        Borders::ALL
+        Borders::BOTTOM | Borders::LEFT | Borders::RIGHT
     };
 
     let block = Block::default()
-        .title(Span::styled(
-            pane_title,
-            Style::default()
-                .fg(if focused { Color::Cyan } else { Color::Gray })
-                .add_modifier(Modifier::BOLD),
-        ))
         .borders(borders)
         .border_set(ASCII_BORDER)
         .border_style(Style::default().fg(border_color));
