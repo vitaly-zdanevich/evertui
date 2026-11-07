@@ -31,3 +31,11 @@ eselect repository enable vitaly-zdanevich-overlay
 eselect sync --repo vitaly-zdanevich-overlay
 emerge -a evertui
 ```
+
+## Development
+
+Enable the local Git `pre-commit` hook once per clone so `docs/badges/production-code.svg` and `docs/badges/test-code.svg` regenerate automatically from staged files on every commit:
+
+```sh
+python3 tools/install_git_hooks.py
+```

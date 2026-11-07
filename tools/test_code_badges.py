@@ -109,6 +109,35 @@ where
             self.assertEqual(prod, {'src/lib.rs': 3})
             self.assertEqual(tests, {'src/lib.rs': 10})
 
+    def test_counts_python_test_files_excluding_docstrings_and_comments(self):
+        sample_py = '''\
+"""Module docstring excluded."""
+
+import unittest
+
+
+class SampleTest(unittest.TestCase):
+    """Class docstring excluded."""
+
+    def test_ok(self):
+        """Method docstring excluded."""
+        # Comment excluded
+        value = 1 + 1
+        self.assertEqual(value, 2)
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'tools').mkdir()
+            (root / 'tools' / 'test_sample.py').write_text(sample_py, encoding='utf-8')
+            (root / 'tools' / 'helper.py').write_text('x = 1\n', encoding='utf-8')
+
+            prod, tests = compute_counts(
+                root, {'tools/test_sample.py', 'tools/helper.py'}
+            )
+            self.assertEqual(prod, {})
+            # import unittest, class ..., def ..., value = ..., self.assertEqual... = 5 lines
+            self.assertEqual(tests, {'tools/test_sample.py': 5})
+
     def test_badge_svg_is_pure_ascii_and_contains_formatted_count(self):
         svg = badge_svg(4812, scope='production')
         self.assertTrue(svg.isascii())

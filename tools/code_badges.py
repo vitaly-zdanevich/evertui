@@ -9,10 +9,13 @@ Counts nonblank, noncomment physical Rust code lines tracked by Git:
 """
 
 import argparse
+import ast
+import io
 import json
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import tokenize
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -365,6 +368,44 @@ def mask_disabled_rust_items(source: bytes, *, test_mode: bool) -> bytes:
     return bytes(masked)
 
 
+def python_code_line_numbers(source: bytes) -> set[int]:
+    """Return 1-based code line numbers in Python source, excluding comments & docstrings."""
+    tree = ast.parse(source)
+    docstring_spans: set[tuple[int, int]] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            if (
+                node.body
+                and isinstance(node.body[0], ast.Expr)
+                and isinstance(node.body[0].value, ast.Constant)
+                and isinstance(node.body[0].value.value, str)
+            ):
+                doc_node = node.body[0].value
+                if doc_node.lineno is not None and doc_node.end_lineno is not None:
+                    docstring_spans.add((doc_node.lineno, doc_node.end_lineno))
+
+    raw_lines = source.decode('utf-8').splitlines()
+    code_lines: set[int] = set()
+    ignored_types = {
+        tokenize.COMMENT,
+        tokenize.NL,
+        tokenize.NEWLINE,
+        tokenize.INDENT,
+        tokenize.DEDENT,
+        tokenize.ENCODING,
+        tokenize.ENDMARKER,
+    }
+    for tok in tokenize.tokenize(io.BytesIO(source).readline):
+        if tok.type in ignored_types:
+            continue
+        if tok.type == tokenize.STRING and (tok.start[0], tok.end[0]) in docstring_spans:
+            continue
+        for line_no in range(tok.start[0], tok.end[0] + 1):
+            if 1 <= line_no <= len(raw_lines) and raw_lines[line_no - 1].strip():
+                code_lines.add(line_no)
+    return code_lines
+
+
 def compute_counts(root: Path, tracked: set[str]) -> tuple[dict[str, int], dict[str, int]]:
     """Return (production_by_file, test_by_file) line counts."""
     prod_counts: dict[str, int] = {}
@@ -372,23 +413,28 @@ def compute_counts(root: Path, tracked: set[str]) -> tuple[dict[str, int], dict[
 
     for rel in sorted(tracked):
         path = PurePosixPath(rel)
-        if path.suffix != '.rs':
-            continue
-        raw = (root / path).read_bytes()
-        if rel.startswith('src/'):
-            prod_masked = mask_disabled_rust_items(raw, test_mode=False)
-            test_masked = mask_disabled_rust_items(raw, test_mode=True)
-            prod_lines = code_line_numbers(prod_masked)
-            all_lines = code_line_numbers(test_masked)
-            only_test_lines = all_lines - prod_lines
-            if prod_lines:
-                prod_counts[rel] = len(prod_lines)
-            if only_test_lines:
-                test_counts[rel] = len(only_test_lines)
-        elif rel.startswith('tests/'):
-            t_lines = code_line_numbers(mask_disabled_rust_items(raw, test_mode=True))
-            if t_lines:
-                test_counts[rel] = len(t_lines)
+        if path.suffix == '.rs':
+            raw = (root / path).read_bytes()
+            if rel.startswith('src/'):
+                prod_masked = mask_disabled_rust_items(raw, test_mode=False)
+                test_masked = mask_disabled_rust_items(raw, test_mode=True)
+                prod_lines = code_line_numbers(prod_masked)
+                all_lines = code_line_numbers(test_masked)
+                only_test_lines = all_lines - prod_lines
+                if prod_lines:
+                    prod_counts[rel] = len(prod_lines)
+                if only_test_lines:
+                    test_counts[rel] = len(only_test_lines)
+            elif rel.startswith('tests/'):
+                t_lines = code_line_numbers(mask_disabled_rust_items(raw, test_mode=True))
+                if t_lines:
+                    test_counts[rel] = len(t_lines)
+        elif path.suffix == '.py' and (
+            rel.startswith('tests/') or (rel.startswith('tools/') and path.name.startswith('test_'))
+        ):
+            py_lines = python_code_line_numbers((root / path).read_bytes())
+            if py_lines:
+                test_counts[rel] = len(py_lines)
 
     return prod_counts, test_counts
 
