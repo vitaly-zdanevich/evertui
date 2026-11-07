@@ -298,31 +298,18 @@ fn render_left_titles_panel(
         return;
     }
 
-    let max_title_cols = usize::from(inner.width.saturating_sub(4));
+    let max_title_cols = usize::from(inner.width);
     let items: Vec<ListItem<'_>> = app
         .notes
         .iter()
         .take(MAX_LEFT_TITLES)
-        .enumerate()
-        .map(|(i, note)| {
-            let num = format!("{:>2} ", i + 1);
+        .map(|note| {
             let clean_title = if note.title.trim().is_empty() {
                 "(Untitled)".to_owned()
             } else {
                 truncate_ascii_dots(&note.title, max_title_cols)
             };
-            let is_sel = i == app.selected_index;
-            let num_style = if is_sel {
-                Style::default()
-                    .fg(if focused { Color::Black } else { Color::Cyan })
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(num, num_style),
-                Span::raw(clean_title),
-            ]))
+            ListItem::new(Line::from(Span::raw(clean_title)))
         })
         .collect();
 
@@ -1226,6 +1213,53 @@ mod tests {
         app.open_preferences_modal();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         assert_pure_ascii_and_ansi16(terminal.backend().buffer());
+    }
+
+    #[test]
+    fn left_panel_renders_titles_without_index_numbers() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::Bootstrapped {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+            page: SearchPage {
+                total_matching: 2,
+                notes: vec![
+                    NoteSummary {
+                        guid: "g1".into(),
+                        title: "Alpha title".to_owned(),
+                        created: None,
+                        updated: None,
+                        notebook_guid: None,
+                        tag_guids: Vec::new(),
+                        content_length: None,
+                    },
+                    NoteSummary {
+                        guid: "g2".into(),
+                        title: "Beta title".to_owned(),
+                        created: None,
+                        updated: None,
+                        notebook_guid: None,
+                        tag_guids: Vec::new(),
+                        content_length: None,
+                    },
+                ],
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let inner = app.geometry.left_titles_inner.expect("left panel visible");
+        let buf = terminal.backend().buffer();
+        let row0: String = (inner.x..inner.x + inner.width)
+            .map(|x| buf[(x, inner.y)].symbol())
+            .collect();
+        let row1: String = (inner.x..inner.x + inner.width)
+            .map(|x| buf[(x, inner.y + 1)].symbol())
+            .collect();
+        assert!(row0.starts_with("Alpha title"), "unexpected row0: {row0:?}");
+        assert!(row1.starts_with("Beta title"), "unexpected row1: {row1:?}");
     }
 
     fn assert_pure_ascii_and_ansi16(buf: &ratatui::buffer::Buffer) {
