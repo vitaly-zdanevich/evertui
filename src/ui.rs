@@ -651,13 +651,13 @@ fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         (ModalState::Help, _) => " Esc / Enter / q:Close help",
         (ModalState::None, FocusTarget::LeftTitles) => {
-            " j/k:Select  Enter:Edit in Vim  /:Search  t:Tags  n:Notebook  r:Rename  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
+            " j/k/1-9:Select  Enter:Edit in Vim  /:Search  t:Tags  n:Notebook  r:Rename  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
         }
         (ModalState::None, FocusTarget::SearchInput) => {
             " Enter:Run search | Syntax: tag:x  notebook:y  t:x  n:y  \"t x\"  \"n y\" | Ctrl+U:Clear | Esc:Back"
         }
         (ModalState::None, FocusTarget::RightVim) if app.vim_session.is_none() => {
-            " j/k/PgUp/PgDn:Scroll  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  q:Quit"
+            " j/k/PgUp/PgDn:Scroll  1-9:Note  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  q:Quit"
         }
         (ModalState::None, FocusTarget::RightVim) => {
             " :w:Save to Evernote | :q:Close Vim | Ctrl+\\ / Alt+h:Titles | F2:Toggle Left | F4:Tags | F5:Notebook | F7:Prefs"
@@ -1083,7 +1083,7 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("  * j / k / Up / Down / Click  Select note (fast text preview)"),
+        Line::from("  * j / k / 1-9 / Click        Select note (fast text preview)"),
         Line::from("  * Enter / e / i              Replace preview with embedded Vim"),
         Line::from("  * Tab / l / PgUp / PgDn      Focus or scroll text preview"),
         Line::from("  * p (or F7 / Alt+p)          Preferences (\"Vim preview\" toggle)"),

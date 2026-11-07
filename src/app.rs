@@ -1080,6 +1080,12 @@ impl App {
             KeyCode::Char('n') => self.open_notebook_modal(),
             KeyCode::Char('r') if !ctrl => self.open_rename_modal(),
             KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
+            KeyCode::Char(digit @ '1'..='9')
+                if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let idx = usize::from(digit as u8 - b'1');
+                self.set_selection(idx);
+            }
             KeyCode::Char('j') | KeyCode::Down => self.scroll_preview(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_preview(-1),
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_preview(12),
@@ -1106,6 +1112,12 @@ impl App {
             KeyCode::Char('R') => self.execute_search(),
             KeyCode::Char('r') if ctrl => self.execute_search(),
             KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
+            KeyCode::Char(digit @ '1'..='9')
+                if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let idx = usize::from(digit as u8 - b'1');
+                self.set_selection(idx);
+            }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::PageDown => self.scroll_preview(12),
@@ -1688,5 +1700,68 @@ mod tests {
             KeyModifiers::empty(),
         )));
         assert!(matches!(app.modal, ModalState::None));
+    }
+
+    #[test]
+    fn digit_keys_1_to_9_select_corresponding_note_index() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        let notes: Vec<NoteSummary> = (1..=5)
+            .map(|i| NoteSummary {
+                guid: NoteGuid(format!("g-{i}")),
+                title: format!("Note {i}"),
+                created: None,
+                updated: None,
+                notebook_guid: None,
+                tag_guids: Vec::new(),
+                content_length: None,
+            })
+            .collect();
+
+        app.handle_worker_event(WorkerEvent::Bootstrapped {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+            page: SearchPage {
+                total_matching: 5,
+                notes,
+            },
+        });
+        assert_eq!(app.selected_index, 0);
+
+        // Press '4' in LeftTitles -> selects index 3 (4th note).
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('4'),
+            KeyModifiers::empty(),
+        )));
+        assert_eq!(app.selected_index, 3);
+
+        // Out-of-bounds digit ('9' when only 5 notes exist) and '0' are ignored.
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('9'),
+            KeyModifiers::empty(),
+        )));
+        assert_eq!(app.selected_index, 3);
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('0'),
+            KeyModifiers::empty(),
+        )));
+        assert_eq!(app.selected_index, 3);
+
+        // Press '2' in native text preview (RightVim without active Vim session) -> selects index 1.
+        app.focus = FocusTarget::RightVim;
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('2'),
+            KeyModifiers::empty(),
+        )));
+        assert_eq!(app.selected_index, 1);
+
+        // Typing digits in SearchInput appends to search text without switching selection.
+        app.focus = FocusTarget::SearchInput;
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('5'),
+            KeyModifiers::empty(),
+        )));
+        assert_eq!(app.selected_index, 1);
+        assert_eq!(app.search_input.text, "5");
     }
 }

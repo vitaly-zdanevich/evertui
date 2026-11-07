@@ -10,7 +10,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
 ## Features
 
 - **Two-panel layout**:
-  - **Left panel**: Up to 20 note titles (`j`/`k`, mouse click, scroll wheel).
+  - **Left panel**: Up to 20 note titles (`j`/`k`, `1`-`9`, mouse click, scroll wheel).
   - **Right panel**: Note metadata header (Title, Notebook, Tags, Created & Updated dates, size, attachment counts) + **fast native text preview** by default, replacing the preview with **real embedded `vim`** on `Enter` (`:w` saves directly to Evernote with an ASCII animated indicator).
 - **Preferences (`p` / `F7` / `Alt+p`)**:
   - `[ ] Vim preview` (unchecked by default for instant browsing; check to preview every selected note directly in embedded `vim`, saved in `~/.config/evertui/preferences.conf`).

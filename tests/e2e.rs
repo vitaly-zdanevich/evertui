@@ -238,8 +238,15 @@ fn full_tui_workflow_with_placeholders_search_tags_notebook_and_real_vim_save() 
         thread::sleep(Duration::from_millis(25));
     }
 
-    // 1. Left panel enforces 20 titles max.
+    // 1. Left panel enforces 20 titles max, and digits 1-9 jump directly to note indices.
     assert_eq!(app.notes.len(), 20);
+    app.handle_terminal_event(key_press(KeyCode::Char('9')));
+    assert_eq!(app.selected_index, 8);
+    app.handle_terminal_event(key_press(KeyCode::Char('1')));
+    assert_eq!(app.selected_index, 0);
+    while let Ok(evt) = backend.evt_rx.try_recv() {
+        app.handle_worker_event(evt);
+    }
     // 2. Default mode (`vim_preview == false`) renders fast native Text Preview without spawning Vim.
     assert!(!app.preferences.vim_preview);
     assert!(app.vim_session.is_none());
