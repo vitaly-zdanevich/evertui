@@ -811,7 +811,9 @@ impl App {
             if self.selected_summary().is_some_and(|s| s.guid == guid) {
                 self.loading_note_guid = Some(guid.clone());
             }
-            let _ = self.cmd_tx.send(WorkerCommand::LoadNote { request_id, guid });
+            let _ = self
+                .cmd_tx
+                .send(WorkerCommand::LoadNote { request_id, guid });
             return;
         }
     }
