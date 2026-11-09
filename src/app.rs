@@ -11,7 +11,7 @@ use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
@@ -340,6 +340,10 @@ pub struct App {
 
     pub loading_list: bool,
     pub loading_note_guid: Option<NoteGuid>,
+    /// Visible notes still waiting for a content fetch. The selected note is first.
+    prefetch_queue: VecDeque<NoteGuid>,
+    /// The single in-flight `LoadNote`. The worker never has more than one.
+    note_load_inflight: Option<NoteGuid>,
     pub next_request_id: u64,
     pub latest_search_req: u64,
     pub latest_note_req: u64,
@@ -392,6 +396,8 @@ impl App {
 
             loading_list: true,
             loading_note_guid: None,
+            prefetch_queue: VecDeque::new(),
+            note_load_inflight: None,
             next_request_id: 1,
             latest_search_req: 0,
             latest_note_req: 0,
@@ -579,14 +585,15 @@ impl App {
                     self.apply_search_page(page);
                 }
             }
-            WorkerEvent::NoteLoaded { request_id, note } => {
+            WorkerEvent::NoteLoaded { note, .. } => {
                 let guid = note.guid.clone();
                 let prepared = PreparedNoteDocument::from_enml(&note.enml, &note.resources);
                 self.prepared_docs.insert(guid.clone(), prepared);
                 self.note_cache.insert(guid.clone(), note);
-                if self.loading_note_guid.as_ref() == Some(&guid)
-                    && request_id == self.latest_note_req
-                {
+                if self.note_load_inflight.as_ref() == Some(&guid) {
+                    self.note_load_inflight = None;
+                }
+                if self.loading_note_guid.as_ref() == Some(&guid) {
                     self.loading_note_guid = None;
                 }
                 if self.selected_summary().is_some_and(|s| s.guid == guid)
@@ -595,6 +602,21 @@ impl App {
                 {
                     self.pending_vim_guid = None;
                     self.ensure_vim_for_note(&guid);
+                }
+                self.pump_prefetch();
+            }
+            WorkerEvent::NoteLoadFailed { guid, message, .. } => {
+                if self.note_load_inflight.as_ref() == Some(&guid) {
+                    self.note_load_inflight = None;
+                }
+                if self.loading_note_guid.as_ref() == Some(&guid) {
+                    self.loading_note_guid = None;
+                }
+                self.status_error = Some(format!("Load note: {message}"));
+                if is_rate_limited(&message) {
+                    self.prefetch_queue.clear();
+                } else {
+                    self.pump_prefetch();
                 }
             }
             WorkerEvent::ContentSaved {
@@ -734,8 +756,63 @@ impl App {
         if self.notes.is_empty() {
             self.vim_session = None;
             self.loading_note_guid = None;
+            self.prefetch_queue.clear();
         } else {
             self.on_selection_changed();
+        }
+    }
+
+    /// Rebuilds the one-at-a-time fetch list for the notes currently on screen.
+    /// The selected note is first so its preview is not stuck behind the rest.
+    fn rebuild_prefetch_queue(&mut self) {
+        let selected = self.selected_summary().map(|s| s.guid.clone());
+        let visible: Vec<NoteGuid> = self.notes.iter().map(|n| n.guid.clone()).collect();
+        let inflight = self.note_load_inflight.clone();
+        let mut queue = VecDeque::new();
+        let mut consider = |guid: NoteGuid| {
+            if self.note_cache.contains_key(&guid)
+                || inflight.as_ref() == Some(&guid)
+                || queue.contains(&guid)
+            {
+                return;
+            }
+            queue.push_back(guid);
+        };
+        if let Some(guid) = selected {
+            consider(guid);
+        }
+        for guid in visible {
+            consider(guid);
+        }
+        self.prefetch_queue = queue;
+    }
+
+    fn prioritize_prefetch(&mut self, guid: NoteGuid) {
+        if self.note_cache.contains_key(&guid) || self.note_load_inflight.as_ref() == Some(&guid) {
+            return;
+        }
+        self.prefetch_queue.retain(|queued| queued != &guid);
+        self.prefetch_queue.push_front(guid);
+        self.pump_prefetch();
+    }
+
+    /// Sends the next content fetch only when the worker is idle.
+    fn pump_prefetch(&mut self) {
+        if self.loading_list || self.note_load_inflight.is_some() {
+            return;
+        }
+        while let Some(guid) = self.prefetch_queue.pop_front() {
+            if self.note_cache.contains_key(&guid) || !self.notes.iter().any(|n| n.guid == guid) {
+                continue;
+            }
+            let request_id = self.alloc_req_id();
+            self.latest_note_req = request_id;
+            self.note_load_inflight = Some(guid.clone());
+            if self.selected_summary().is_some_and(|s| s.guid == guid) {
+                self.loading_note_guid = Some(guid.clone());
+            }
+            let _ = self.cmd_tx.send(WorkerCommand::LoadNote { request_id, guid });
+            return;
         }
     }
 
@@ -769,14 +846,10 @@ impl App {
             }
         } else {
             self.vim_session = None;
-            let req_id = self.alloc_req_id();
-            self.latest_note_req = req_id;
-            self.loading_note_guid = Some(guid.clone());
-            let _ = self.cmd_tx.send(WorkerCommand::LoadNote {
-                request_id: req_id,
-                guid,
-            });
+            self.loading_note_guid = Some(guid);
         }
+        self.rebuild_prefetch_queue();
+        self.pump_prefetch();
     }
 
     /// Replaces the text preview with real embedded Vim for editing the selected note.
@@ -789,7 +862,9 @@ impl App {
             self.pending_vim_guid = None;
             self.ensure_vim_for_note(&guid);
         } else {
-            self.pending_vim_guid = Some(guid);
+            self.pending_vim_guid = Some(guid.clone());
+            self.loading_note_guid = Some(guid.clone());
+            self.prioritize_prefetch(guid);
         }
     }
 
@@ -860,6 +935,7 @@ impl App {
         let req_id = self.alloc_req_id();
         self.latest_search_req = req_id;
         self.loading_list = true;
+        self.prefetch_queue.clear();
         self.status_error = None;
         let _ = self.cmd_tx.send(WorkerCommand::Search {
             request_id: req_id,
@@ -1590,6 +1666,10 @@ impl App {
     }
 }
 
+fn is_rate_limited(message: &str) -> bool {
+    message.contains("RATE_LIMIT_REACHED") || message.contains("429")
+}
+
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     col >= r.x
         && col < r.x.saturating_add(r.width)
@@ -1765,5 +1845,88 @@ mod tests {
         )));
         assert_eq!(app.selected_index, 1);
         assert_eq!(app.search_input.text, "5");
+    }
+
+    #[test]
+    fn prefetches_visible_notes_one_at_a_time_and_stops_on_rate_limit() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Bootstrap)));
+
+        let notes: Vec<NoteSummary> = (1..=3)
+            .map(|i| NoteSummary {
+                guid: NoteGuid(format!("g-{i}")),
+                title: format!("Note {i}"),
+                created: None,
+                updated: None,
+                notebook_guid: None,
+                tag_guids: Vec::new(),
+                content_length: None,
+            })
+            .collect();
+
+        app.handle_worker_event(WorkerEvent::Bootstrapped {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+            page: SearchPage {
+                total_matching: 3,
+                notes,
+            },
+        });
+
+        assert_eq!(take_load(&rx), "g-1");
+        assert!(rx.try_recv().is_err());
+
+        app.set_selection(2);
+        assert!(rx.try_recv().is_err());
+
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note: detail("g-1"),
+        });
+        assert_eq!(take_load(&rx), "g-3");
+
+        app.handle_worker_event(WorkerEvent::NoteLoadFailed {
+            request_id: 2,
+            guid: NoteGuid::from("g-3"),
+            message: "Evernote NOT_FOUND".to_owned(),
+        });
+        assert_eq!(take_load(&rx), "g-2");
+
+        app.handle_worker_event(WorkerEvent::NoteLoadFailed {
+            request_id: 3,
+            guid: NoteGuid::from("g-2"),
+            message: "Evernote RATE_LIMIT_REACHED (19)".to_owned(),
+        });
+        assert!(rx.try_recv().is_err());
+        assert!(app.note_cache.contains_key(&NoteGuid::from("g-1")));
+        assert!(!app.note_cache.contains_key(&NoteGuid::from("g-2")));
+
+        app.execute_search();
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Search { .. })));
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn take_load(rx: &mpsc::Receiver<WorkerCommand>) -> String {
+        match rx.try_recv() {
+            Ok(WorkerCommand::LoadNote { guid, .. }) => guid.0,
+            other => panic!("expected one LoadNote, got {other:?}"),
+        }
+    }
+
+    fn detail(guid: &str) -> NoteDetail {
+        NoteDetail {
+            guid: NoteGuid::from(guid),
+            title: guid.to_owned(),
+            enml: "<en-note><div>body</div></en-note>".to_owned(),
+            created: None,
+            updated: None,
+            notebook_guid: None,
+            tag_guids: Vec::new(),
+            tag_names: Vec::new(),
+            source_url: None,
+            content_length: Some(4),
+            resources: Vec::new(),
+        }
     }
 }

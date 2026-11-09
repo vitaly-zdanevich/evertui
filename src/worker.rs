@@ -58,6 +58,11 @@ pub enum WorkerEvent {
         request_id: u64,
         note: NoteDetail,
     },
+    NoteLoadFailed {
+        request_id: u64,
+        guid: NoteGuid,
+        message: String,
+    },
     ContentSaved {
         guid: NoteGuid,
         enml: String,
@@ -145,10 +150,10 @@ impl BackendHandle {
                                         evt_tx.send(WorkerEvent::NoteLoaded { request_id, note });
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::Error {
-                                        context: "Load note".to_owned(),
+                                    let _ = evt_tx.send(WorkerEvent::NoteLoadFailed {
+                                        request_id,
+                                        guid,
                                         message: e.to_string(),
-                                        was_save: false,
                                     });
                                 }
                             }
