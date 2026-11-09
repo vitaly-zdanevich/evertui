@@ -318,6 +318,16 @@ pub struct LayoutGeometry {
     pub modal_inner: Option<Rect>,
 }
 
+/// One search result screen, kept so back and forward do not hit the network.
+#[derive(Clone, Debug)]
+struct SearchScreen {
+    query: String,
+    total_matching: usize,
+    notes: Vec<NoteSummary>,
+    selected_index: usize,
+    preview_scroll: u16,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub focus: FocusTarget,
@@ -328,6 +338,10 @@ pub struct App {
 
     pub search_input: TextInput,
     pub active_query: String,
+    search_history: Vec<SearchScreen>,
+    search_history_pos: usize,
+    /// Query for the search that has been sent and not yet applied.
+    pending_search_query: Option<String>,
     pub total_matching: usize,
     pub notes: Vec<NoteSummary>,
     pub selected_index: usize,
@@ -384,6 +398,9 @@ impl App {
 
             search_input: TextInput::default(),
             active_query: String::new(),
+            search_history: Vec::new(),
+            search_history_pos: 0,
+            pending_search_query: None,
             total_matching: 0,
             notes: Vec::new(),
             selected_index: 0,
@@ -635,6 +652,8 @@ impl App {
                 {
                     sum.updated = updated;
                 }
+                self.sync_history_note(&guid);
+                self.remember_current_screen();
                 self.finish_saving("Saved");
             }
             WorkerEvent::TagsSaved {
@@ -660,6 +679,8 @@ impl App {
                         sum.updated = updated;
                     }
                 }
+                self.sync_history_note(&guid);
+                self.remember_current_screen();
                 self.finish_saving("Tags saved");
             }
             WorkerEvent::NotebookSaved {
@@ -679,6 +700,8 @@ impl App {
                         sum.updated = updated;
                     }
                 }
+                self.sync_history_note(&guid);
+                self.remember_current_screen();
                 self.finish_saving("Notebook updated");
             }
             WorkerEvent::NoteRenamed {
@@ -698,6 +721,8 @@ impl App {
                         sum.updated = updated;
                     }
                 }
+                self.sync_history_note(&guid);
+                self.remember_current_screen();
                 self.finish_saving("Renamed");
             }
             WorkerEvent::NoteCreated { note } => {
@@ -723,6 +748,7 @@ impl App {
                 self.selected_index = 0;
                 self.ensure_vim_for_note(&guid);
                 self.focus = FocusTarget::RightVim;
+                self.remember_current_screen();
                 self.finish_saving("Created");
             }
             WorkerEvent::Error {
@@ -730,6 +756,9 @@ impl App {
                 message,
                 was_save,
             } => {
+                if context == "Search" {
+                    self.pending_search_query = None;
+                }
                 self.loading_list = false;
                 self.loading_note_guid = None;
                 let full = format!("{context}: {message}");
@@ -746,12 +775,18 @@ impl App {
     }
 
     fn apply_search_page(&mut self, mut page: SearchPage) {
+        if let Some(query) = self.pending_search_query.take() {
+            self.active_query = query.clone();
+            self.search_input = TextInput::new(query);
+        }
         if page.notes.len() > MAX_LEFT_TITLES {
             page.notes.truncate(MAX_LEFT_TITLES);
         }
         self.total_matching = page.total_matching;
         self.notes = page.notes;
         self.selected_index = 0;
+        self.preview_scroll = 0;
+        self.commit_search_screen();
 
         if self.notes.is_empty() {
             self.vim_session = None;
@@ -760,6 +795,104 @@ impl App {
         } else {
             self.on_selection_changed();
         }
+    }
+
+    fn capture_screen(&self) -> SearchScreen {
+        SearchScreen {
+            query: self.active_query.clone(),
+            total_matching: self.total_matching,
+            notes: self.notes.clone(),
+            selected_index: self.selected_index,
+            preview_scroll: self.preview_scroll,
+        }
+    }
+
+    /// Writes the visible screen into the current history slot.
+    fn remember_current_screen(&mut self) {
+        if self
+            .search_history
+            .get(self.search_history_pos)
+            .is_none_or(|slot| slot.query != self.active_query)
+        {
+            return;
+        }
+        let screen = self.capture_screen();
+        self.search_history[self.search_history_pos] = screen;
+    }
+
+    /// Records a newly arrived search. Repeating the current query replaces that slot.
+    fn commit_search_screen(&mut self) {
+        let screen = self.capture_screen();
+        if self
+            .search_history
+            .get(self.search_history_pos)
+            .is_some_and(|existing| existing.query == screen.query)
+        {
+            self.search_history[self.search_history_pos] = screen;
+            return;
+        }
+        self.search_history
+            .truncate(self.search_history_pos.saturating_add(1));
+        self.search_history.push(screen);
+        self.search_history_pos = self.search_history.len() - 1;
+    }
+
+    fn sync_history_note(&mut self, guid: &NoteGuid) {
+        let Some(updated) = self.notes.iter().find(|note| &note.guid == guid).cloned() else {
+            return;
+        };
+        for screen in &mut self.search_history {
+            if let Some(note) = screen.notes.iter_mut().find(|note| &note.guid == guid) {
+                *note = updated.clone();
+            }
+        }
+    }
+
+    fn navigate_search_history(&mut self, delta: isize) {
+        if self.search_history.is_empty() {
+            return;
+        }
+        self.remember_current_screen();
+        let current = isize::try_from(self.search_history_pos).unwrap_or(0);
+        let max = isize::try_from(self.search_history.len() - 1).unwrap_or(0);
+        let next = current + delta;
+        if !(0..=max).contains(&next) {
+            return;
+        }
+        let Some(next) = usize::try_from(next).ok() else {
+            return;
+        };
+        self.restore_search_screen(next);
+    }
+
+    fn restore_search_screen(&mut self, pos: usize) {
+        let Some(screen) = self.search_history.get(pos).cloned() else {
+            return;
+        };
+        self.search_history_pos = pos;
+        self.pending_search_query = None;
+        self.latest_search_req = self.alloc_req_id();
+        self.loading_list = false;
+        self.active_query.clone_from(&screen.query);
+        self.search_input = TextInput::new(screen.query);
+        self.total_matching = screen.total_matching;
+        self.notes = screen.notes;
+        self.selected_index = if self.notes.is_empty() {
+            0
+        } else {
+            screen.selected_index.min(self.notes.len() - 1)
+        };
+        let scroll = screen.preview_scroll;
+        self.prefetch_queue.clear();
+        if self.notes.is_empty() {
+            self.vim_session = None;
+            self.loading_note_guid = None;
+            self.preview_scroll = scroll;
+        } else {
+            self.on_selection_changed();
+            self.preview_scroll = scroll;
+        }
+        self.remember_current_screen();
     }
 
     /// Rebuilds the one-at-a-time fetch list for the notes currently on screen.
@@ -882,6 +1015,7 @@ impl App {
             let sub = delta.unsigned_abs();
             self.preview_scroll = self.preview_scroll.saturating_sub(sub);
         }
+        self.remember_current_screen();
     }
 
     pub fn ensure_vim_for_note(&mut self, guid: &NoteGuid) {
@@ -931,8 +1065,10 @@ impl App {
     }
 
     pub fn execute_search(&mut self) {
-        self.active_query = self.search_input.text.trim().to_owned();
-        let parsed = ParsedSearch::parse(&self.active_query);
+        self.remember_current_screen();
+        let query = self.search_input.text.trim().to_owned();
+        self.pending_search_query = Some(query.clone());
+        let parsed = ParsedSearch::parse(&query);
         let filter = parsed.compile(&self.notebooks);
         let req_id = self.alloc_req_id();
         self.latest_search_req = req_id;
@@ -1121,6 +1257,14 @@ impl App {
             }
             KeyCode::Char('l') if alt => {
                 self.focus = FocusTarget::RightVim;
+                return;
+            }
+            KeyCode::Left if alt => {
+                self.navigate_search_history(-1);
+                return;
+            }
+            KeyCode::Right if alt => {
+                self.navigate_search_history(1);
                 return;
             }
             _ => {}
@@ -1665,6 +1809,7 @@ impl App {
         }
         self.selected_index = index;
         self.on_selection_changed();
+        self.remember_current_screen();
     }
 }
 
@@ -1930,5 +2075,119 @@ mod tests {
             content_length: Some(4),
             resources: Vec::new(),
         }
+    }
+
+    fn summary(guid: &str, title: &str) -> NoteSummary {
+        NoteSummary {
+            guid: NoteGuid::from(guid),
+            title: title.to_owned(),
+            created: None,
+            updated: None,
+            notebook_guid: None,
+            tag_guids: Vec::new(),
+            content_length: None,
+        }
+    }
+
+    fn alt_arrow(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::ALT))
+    }
+
+    fn drain_loads(app: &mut App, rx: &mpsc::Receiver<WorkerCommand>) {
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                WorkerCommand::LoadNote { request_id, guid } => {
+                    app.handle_worker_event(WorkerEvent::NoteLoaded {
+                        request_id,
+                        note: detail(guid.as_str()),
+                    });
+                }
+                other => panic!("unexpected worker command: {other:?}"),
+            }
+        }
+    }
+
+    fn run_search(
+        app: &mut App,
+        rx: &mpsc::Receiver<WorkerCommand>,
+        query: &str,
+        notes: Vec<NoteSummary>,
+    ) {
+        app.search_input = TextInput::new(query);
+        app.execute_search();
+        let request_id = match rx.try_recv() {
+            Ok(WorkerCommand::Search { request_id, .. }) => request_id,
+            other => panic!("expected Search, got {other:?}"),
+        };
+        app.handle_worker_event(WorkerEvent::SearchCompleted {
+            request_id,
+            page: SearchPage {
+                total_matching: notes.len(),
+                notes,
+            },
+        });
+        drain_loads(app, rx);
+    }
+
+    #[test]
+    fn search_history_moves_back_and_forward_without_network() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Bootstrap)));
+        app.handle_worker_event(WorkerEvent::Bootstrapped {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("home", "Home")],
+            },
+        });
+        drain_loads(&mut app, &rx);
+
+        run_search(
+            &mut app,
+            &rx,
+            "aaa",
+            vec![summary("a1", "Alpha"), summary("a2", "Alpine")],
+        );
+        app.set_selection(1);
+        drain_loads(&mut app, &rx);
+        run_search(&mut app, &rx, "bbb", vec![summary("b1", "Beta")]);
+        run_search(&mut app, &rx, "ccc", vec![summary("c1", "Gamma")]);
+        assert!(rx.try_recv().is_err());
+
+        app.handle_terminal_event(alt_arrow(KeyCode::Left));
+        app.handle_terminal_event(alt_arrow(KeyCode::Left));
+        assert_eq!(app.active_query, "aaa");
+        assert_eq!(app.notes.len(), 2);
+        assert_eq!(app.notes[1].title, "Alpine");
+        assert_eq!(app.selected_index, 1);
+        assert!(app.note_cache.contains_key(&NoteGuid::from("a2")));
+        assert!(rx.try_recv().is_err());
+
+        app.handle_terminal_event(alt_arrow(KeyCode::Right));
+        app.handle_terminal_event(alt_arrow(KeyCode::Right));
+        assert_eq!(app.active_query, "ccc");
+        assert_eq!(app.notes[0].title, "Gamma");
+        assert!(rx.try_recv().is_err());
+
+        app.search_input = TextInput::new("ddd");
+        app.execute_search();
+        let stale = match rx.try_recv() {
+            Ok(WorkerCommand::Search { request_id, .. }) => request_id,
+            other => panic!("expected Search, got {other:?}"),
+        };
+        app.handle_terminal_event(alt_arrow(KeyCode::Left));
+        assert_eq!(app.active_query, "bbb");
+        app.handle_worker_event(WorkerEvent::SearchCompleted {
+            request_id: stale,
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("d1", "Delta")],
+            },
+        });
+        assert_eq!(app.active_query, "bbb");
+        assert_eq!(app.notes[0].title, "Beta");
+        assert!(rx.try_recv().is_err());
     }
 }

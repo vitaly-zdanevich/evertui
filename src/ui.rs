@@ -541,7 +541,7 @@ fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         }
         (ModalState::Help, _) => " Esc / Enter / q:Close help",
         (ModalState::None, FocusTarget::LeftTitles) => {
-            " j/k/1-9:Select  Enter:Edit in Vim  /:Search  t:Tags  n:Notebook  r:Rename  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
+            " j/k/1-9:Select  Enter:Edit in Vim  /:Search  Alt+Left/Right:History  t:Tags  n:Notebook  r:Rename  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
         }
         (ModalState::None, FocusTarget::SearchInput) => {
             " Enter:Run search | Syntax: tag:x  notebook:y  t:x  n:y  \"t x\"  \"n y\" | Ctrl+U:Clear | Esc:Back"
@@ -923,7 +923,7 @@ fn render_preferences_modal(
 }
 
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometry) {
-    let popup = centered_rect(area, 72, 20);
+    let popup = centered_rect(area, 78, 22);
     let inner = render_modal_surface(
         frame,
         popup,
@@ -945,6 +945,7 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
         )),
         Line::from("  * tag:work   t:work   t work   -t:archive   t:\"two words\""),
         Line::from("  * notebook:INBOX   n:INBOX   n INBOX   n \"Work Notes\""),
+        Line::from("  * Alt+Left / Alt+Right       Back / forward through searches, from memory"),
         Line::from(""),
         Line::from(Span::styled(
             "Left Panel (Titles, max 20):",
