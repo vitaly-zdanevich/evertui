@@ -11,6 +11,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// `+`, `-`, and `|` only. Unicode box drawing fails the Linux TTY ASCII check.
+const ASCII_BORDER: ratatui::symbols::border::Set<'static> = ratatui::symbols::border::Set {
+    top_left: "+",
+    top_right: "+",
+    bottom_left: "+",
+    bottom_right: "+",
+    vertical_left: "|",
+    vertical_right: "|",
+    horizontal_top: "-",
+    horizontal_bottom: "-",
+};
+
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const BAR_FRAMES: &[&str] = &[
     "[==    ]", "[ ==   ]", "[  ==  ]", "[   == ]", "[  ==  ]", "[ ==   ]",
@@ -629,27 +641,13 @@ fn render_modal_surface(
     geom: &mut LayoutGeometry,
 ) -> Rect {
     frame.render_widget(Clear, popup);
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
-        popup,
-    );
-    let inner = Rect {
-        x: popup.x.saturating_add(1),
-        y: popup.y.saturating_add(1),
-        width: popup.width.saturating_sub(2),
-        height: popup.height.saturating_sub(2),
-    };
-    if popup.height >= 1 && inner.width >= 1 {
-        frame.render_widget(
-            Paragraph::new(Line::from(title)).style(Style::default().bg(Color::Black)),
-            Rect {
-                x: inner.x,
-                y: popup.y,
-                width: inner.width,
-                height: 1,
-            },
-        );
-    }
+    let block = Block::bordered()
+        .border_set(ASCII_BORDER)
+        .border_style(Style::default().fg(Color::Gray).bg(Color::Black))
+        .style(Style::default().bg(Color::Black))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
     geom.modal_area = Some(popup);
     geom.modal_inner = Some(inner);
     inner
@@ -1278,7 +1276,7 @@ mod tests {
             );
         }
 
-        // No `+---` box borders or `----` horizontal rules anywhere on screen or in modals.
+        // No `+---` box borders or `----` horizontal rules on the main screen.
         let mut screen = String::new();
         for y in 0..20 {
             for x in 0..100 {
@@ -1292,6 +1290,15 @@ mod tests {
         app.open_preferences_modal();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
+        let popup = app.geometry.modal_area.expect("preferences popup");
+        assert_eq!(buf[(popup.x, popup.y)].symbol(), "+");
+        assert_eq!(buf[(popup.right() - 1, popup.y)].symbol(), "+");
+        assert_eq!(buf[(popup.x, popup.bottom() - 1)].symbol(), "+");
+        assert_eq!(buf[(popup.right() - 1, popup.bottom() - 1)].symbol(), "+");
+        assert_eq!(buf[(popup.x, popup.y + 1)].symbol(), "|");
+        assert_eq!(buf[(popup.right() - 2, popup.y)].symbol(), "-");
+        assert_eq!(buf[(popup.x + 1, popup.bottom() - 1)].symbol(), "-");
+
         let mut modal_screen = String::new();
         for y in 0..20 {
             for x in 0..100 {
@@ -1300,8 +1307,7 @@ mod tests {
             modal_screen.push('\n');
         }
         assert!(modal_screen.contains("Preferences (p)"));
-        assert!(!modal_screen.contains("+---"));
-        assert!(!modal_screen.contains("----"));
+        assert!(modal_screen.contains("+---") || modal_screen.contains("---+"));
     }
 
     #[test]

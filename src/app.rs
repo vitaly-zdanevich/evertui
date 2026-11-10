@@ -1823,7 +1823,7 @@ impl App {
                     }
                     return;
                 }
-                // List rows inside borderless TagEditor / NotebookPicker begin at inner.y + 2
+                // List rows inside TagEditor / NotebookPicker begin at inner.y + 2
                 if row >= inner.y + 2 {
                     let clicked_row = usize::from(row - (inner.y + 2));
                     let modal = std::mem::take(&mut self.modal);
