@@ -185,6 +185,18 @@ impl EvernoteService for MockEvernoteService {
         Ok(Some(TimestampMs(1_762_100_000_000)))
     }
 
+    fn set_note_source_url(
+        &mut self,
+        _guid: &NoteGuid,
+        _title: &str,
+        source_url: Option<&str>,
+    ) -> Result<(Option<String>, Option<TimestampMs>), ApiError> {
+        Ok((
+            source_url.map(str::to_owned),
+            Some(TimestampMs(1_762_100_000_000)),
+        ))
+    }
+
     fn create_note(
         &mut self,
         title: &str,

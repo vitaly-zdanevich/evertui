@@ -9,7 +9,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SPINNER_FRAMES: &[&str] = &["|", "/", "-", "\\"];
 const BAR_FRAMES: &[&str] = &[
@@ -314,9 +314,11 @@ fn render_right_note_panel(
         return;
     }
 
+    let max_header = inner.height.saturating_sub(1).max(1);
+    let header_h = note_header_height(app, max_header);
     let sections = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([Constraint::Length(header_h), Constraint::Min(1)])
         .split(inner);
 
     render_note_metadata_header(frame, app, sections[0], geom);
@@ -480,7 +482,7 @@ fn render_note_metadata_header(
         ),
     ]);
 
-    // Row 2: Created | Updated | Attachments | Size | URL
+    // Row 2: Created | Updated | Attachments | Size. The source URL is one line below.
     let created = detail
         .and_then(|d| d.created)
         .or(summary.created)
@@ -503,9 +505,6 @@ fn render_note_metadata_header(
         if let Some(len) = d.content_length.or(summary.content_length) {
             meta_extra.push(format_bytes(len));
         }
-        if let Some(url) = &d.source_url {
-            meta_extra.push(truncate_ascii_dots(url, 28));
-        }
     }
     let extra_str = if meta_extra.is_empty() {
         String::new()
@@ -521,10 +520,50 @@ fn render_note_metadata_header(
         Span::styled(extra_str, Style::default().fg(Color::DarkGray)),
     ]);
 
+    let meta_height = 3.min(area.height);
     frame.render_widget(
         Paragraph::new(vec![line_title, line_nb_tags, line_dates]),
-        area,
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: meta_height,
+        },
     );
+
+    if let Some(d) = detail {
+        let url_area = Rect {
+            x: area.x,
+            y: area.y.saturating_add(meta_height),
+            width: area.width,
+            height: area.height.saturating_sub(meta_height),
+        };
+        geom.url_hit = url_area;
+        if url_area.width > 0 && url_area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(source_url_line(d.source_url.as_deref())),
+                url_area,
+            );
+        }
+    }
+}
+
+fn note_header_height(app: &App, max_rows: u16) -> u16 {
+    let rows = if app.selected_detail().is_some() {
+        4
+    } else {
+        3
+    };
+    rows.min(max_rows).max(1)
+}
+
+fn source_url_line(url: Option<&str>) -> Line<'static> {
+    let body = url.unwrap_or("(none)").to_owned();
+    Line::from(vec![
+        Span::styled(" URL: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(body, Style::default().fg(Color::White)),
+        Span::styled("  [u]", Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -535,22 +574,29 @@ fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         (ModalState::NotebookPicker(_), _) => {
             " Up/Down:Select | Type:Filter notebooks | Enter:Set notebook | Esc:Cancel"
         }
-        (ModalState::TextPrompt(_), _) => " Enter:Confirm | Ctrl+U:Clear | Esc:Cancel",
+        (ModalState::TextPrompt(pm), _) => match pm.kind {
+            PromptKind::SetSourceUrl => {
+                " Enter:Save | empty Enter:Clear URL | Ctrl+U:Clear field | Esc:Cancel"
+            }
+            PromptKind::RenameNote | PromptKind::CreateNote => {
+                " Enter:Confirm | Ctrl+U:Clear | Esc:Cancel"
+            }
+        },
         (ModalState::Preferences(_), _) => {
             " Space/Enter:Toggle checkbox | Up/Down:Select | Esc/p/q:Close preferences"
         }
         (ModalState::Help, _) => " Esc / Enter / q:Close help",
         (ModalState::None, FocusTarget::LeftTitles) => {
-            " j/k/1-9:Select  Enter:Edit in Vim  /:Search  Alt+Left/Right:History  t:Tags  n:Notebook  r:Rename  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
+            " j/k/1-9:Select  Enter:Edit in Vim  /:Search  Alt+Left/Right:History  t:Tags  n:Notebook  r:Rename  u:URL  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
         }
         (ModalState::None, FocusTarget::SearchInput) => {
             " Enter:Run search | Syntax: tag:x  notebook:y  t:x  n:y  \"t x\"  \"n y\" | Ctrl+U:Clear | Esc:Back"
         }
         (ModalState::None, FocusTarget::RightVim) if app.vim_session.is_none() => {
-            " j/k/PgUp/PgDn:Scroll  1-9:Note  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  q:Quit"
+            " j/k/PgUp/PgDn:Scroll  1-9:Note  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  u:URL  q:Quit"
         }
         (ModalState::None, FocusTarget::RightVim) => {
-            " :w:Save to Evernote | :q:Close Vim | Ctrl+\\ / Alt+h:Titles | F2:Toggle Left | F4:Tags | F5:Notebook | F7:Prefs"
+            " :w:Save to Evernote | :q:Close Vim | Ctrl+\\ / Alt+h:Titles | F2:Toggle Left | F4:Tags | F5:Notebook | F7:Prefs | F8:URL"
         }
     };
 
@@ -814,10 +860,12 @@ fn render_prompt_modal(
     area: Rect,
     geom: &mut LayoutGeometry,
 ) {
-    let popup = centered_rect(area, 56, 4);
+    let is_url = matches!(pm.kind, PromptKind::SetSourceUrl);
+    let popup = centered_rect(area, if is_url { 72 } else { 56 }, 4);
     let title = match pm.kind {
         PromptKind::RenameNote => "Rename Note Title",
         PromptKind::CreateNote => "Create New Note",
+        PromptKind::SetSourceUrl => "Source URL",
     };
 
     let inner = render_modal_surface(
@@ -832,23 +880,59 @@ fn render_prompt_modal(
         geom,
     );
 
-    if inner.height >= 1 {
-        let row = Rect {
-            x: inner.x,
-            y: inner.y,
-            width: inner.width,
-            height: 1,
-        };
-        let prompt = "Title: ";
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(prompt, Style::default().fg(Color::Cyan)),
-                Span::styled(&pm.input.text, Style::default().fg(Color::White)),
-            ])),
-            row,
-        );
-        set_input_cursor(frame, row, prompt, &pm.input.text, pm.input.cursor_chars);
+    if inner.height < 1 || inner.width < 1 {
+        return;
     }
+
+    let prompt = if is_url { "URL: " } else { "Title: " };
+    let row = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: 1,
+    };
+    let field_cols = usize::from(row.width).saturating_sub(prompt.width());
+    let (visible, visible_cursor) =
+        scrolled_input(&pm.input.text, pm.input.cursor_chars, field_cols);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prompt, Style::default().fg(Color::Cyan)),
+            Span::styled(visible.as_str(), Style::default().fg(Color::White)),
+        ])),
+        row,
+    );
+    set_input_cursor(frame, row, prompt, &visible, visible_cursor);
+}
+
+/// Keep a single-line field's cursor inside `max_cols` without dropping characters
+/// the user can still reach with the arrow keys.
+fn scrolled_input(text: &str, cursor_chars: usize, max_cols: usize) -> (String, usize) {
+    if max_cols == 0 {
+        return (String::new(), 0);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor_chars.min(chars.len());
+    let width = |slice: &[char]| -> usize {
+        slice
+            .iter()
+            .map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0))
+            .sum()
+    };
+    let text_width = width(&chars);
+    let cursor_past_end = cursor == chars.len();
+    if text_width < max_cols || (text_width <= max_cols && !cursor_past_end) {
+        return (text.to_owned(), cursor);
+    }
+    let mut start = cursor;
+    while start > 0 && width(&chars[start - 1..cursor]) < max_cols {
+        start -= 1;
+    }
+    let mut end = cursor;
+    while end < chars.len() && width(&chars[start..=end]) <= max_cols {
+        end += 1;
+    }
+    let visible: String = chars[start..end].iter().collect();
+    (visible, cursor - start)
 }
 
 fn render_preferences_modal(
@@ -923,7 +1007,7 @@ fn render_preferences_modal(
 }
 
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometry) {
-    let popup = centered_rect(area, 78, 22);
+    let popup = centered_rect(area, 78, 24);
     let inner = render_modal_surface(
         frame,
         popup,
@@ -960,6 +1044,7 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
         Line::from("  * t (or F4 / Alt+t)          Add / remove tags on note"),
         Line::from("  * n (or F5 / Alt+n)          Change note's notebook"),
         Line::from("  * r (or F6 / Alt+r)          Rename note title"),
+        Line::from("  * u (or F8 / Alt+u / click)  Set source URL (empty clears)"),
         Line::from("  * c                          Create new note"),
         Line::from("  * b (or F2 / Alt+b)          Hide / show left panel"),
         Line::from(""),
@@ -1045,8 +1130,11 @@ fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{NoteSummary, Notebook, NotebookGuid, SearchPage, Tag, TagGuid};
+    use crate::domain::{
+        NoteDetail, NoteGuid, NoteSummary, Notebook, NotebookGuid, SearchPage, Tag, TagGuid,
+    };
     use crate::worker::WorkerEvent;
+    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::sync::mpsc;
@@ -1214,6 +1302,101 @@ mod tests {
         assert!(modal_screen.contains("Preferences (p)"));
         assert!(!modal_screen.contains("+---"));
         assert!(!modal_screen.contains("----"));
+    }
+
+    #[test]
+    fn source_url_stays_on_one_line_and_click_opens_editor() {
+        let url = "https://music.yandex.com/album/3794/track/123456789?lyrics=1&from=evertui";
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.left_panel_visible = false;
+        app.handle_worker_event(WorkerEvent::Bootstrapped {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![NoteSummary {
+                    guid: "g1".into(),
+                    title: "Track".to_owned(),
+                    created: None,
+                    updated: None,
+                    notebook_guid: None,
+                    tag_guids: Vec::new(),
+                    content_length: Some(8192),
+                }],
+            },
+        });
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note: NoteDetail {
+                guid: NoteGuid::from("g1"),
+                title: "Track".to_owned(),
+                enml: "<en-note><div>body</div></en-note>".to_owned(),
+                created: None,
+                updated: None,
+                notebook_guid: None,
+                tag_guids: Vec::new(),
+                tag_names: Vec::new(),
+                source_url: Some(url.to_owned()),
+                content_length: Some(8192),
+                resources: Vec::new(),
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let hit = app.geometry.url_hit;
+        assert_eq!(hit.height, 1);
+        assert_eq!(app.geometry.vim_area.y, hit.y + 1);
+
+        let buf = terminal.backend().buffer();
+        let row: String = (hit.x..hit.x + hit.width)
+            .map(|x| buf[(x, hit.y)].symbol())
+            .collect();
+        let shown = row.trim_end();
+        assert_eq!(shown, format!(" URL: {url}  [u]"));
+        assert!(!shown.contains("..."));
+
+        let dates: String = (hit.x..hit.x + hit.width)
+            .map(|x| buf[(x, hit.y - 1)].symbol())
+            .collect();
+        assert!(dates.contains("8.0 KB"));
+        assert!(!dates.contains("yandex"));
+
+        app.handle_terminal_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::empty(),
+        }));
+        let ModalState::TextPrompt(pm) = &app.modal else {
+            panic!("click should open source URL prompt, got {:?}", app.modal);
+        };
+        assert_eq!(pm.kind, PromptKind::SetSourceUrl);
+        assert_eq!(pm.input.text, url);
+    }
+
+    #[test]
+    fn scrolled_input_keeps_the_cursor_on_screen() {
+        let (visible, cursor) = scrolled_input("abc", 3, 10);
+        assert_eq!(visible, "abc");
+        assert_eq!(cursor, 3);
+
+        let (visible, cursor) = scrolled_input("abcdefghijk", 11, 10);
+        assert_eq!(visible, "cdefghijk");
+        assert_eq!(cursor, 9);
+        assert!(cursor < 10);
+
+        let (visible, cursor) = scrolled_input("abcdefghijk", 0, 10);
+        assert_eq!(visible, "abcdefghij");
+        assert_eq!(cursor, 0);
+
+        let (visible, cursor) = scrolled_input("0123456789", 6, 5);
+        assert_eq!(visible, "23456");
+        assert_eq!(cursor, 4);
+
+        assert_eq!(scrolled_input("abc", 1, 0), (String::new(), 0));
     }
 
     fn assert_pure_ascii_and_ansi16(buf: &ratatui::buffer::Buffer) {

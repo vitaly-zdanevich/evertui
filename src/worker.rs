@@ -36,6 +36,11 @@ pub enum WorkerCommand {
         guid: NoteGuid,
         new_title: String,
     },
+    SetSourceUrl {
+        guid: NoteGuid,
+        title: String,
+        source_url: Option<String>,
+    },
     CreateNote {
         title: String,
         notebook_guid: Option<NotebookGuid>,
@@ -83,6 +88,11 @@ pub enum WorkerEvent {
     NoteRenamed {
         guid: NoteGuid,
         new_title: String,
+        updated: Option<TimestampMs>,
+    },
+    SourceUrlSaved {
+        guid: NoteGuid,
+        source_url: Option<String>,
         updated: Option<TimestampMs>,
     },
     NoteCreated {
@@ -230,6 +240,29 @@ impl BackendHandle {
                                 Err(e) => {
                                     let _ = evt_tx.send(WorkerEvent::Error {
                                         context: "Rename note".to_owned(),
+                                        message: e.to_string(),
+                                        was_save: true,
+                                    });
+                                }
+                            }
+                        }
+                        WorkerCommand::SetSourceUrl {
+                            guid,
+                            title,
+                            source_url,
+                        } => {
+                            match service.set_note_source_url(&guid, &title, source_url.as_deref())
+                            {
+                                Ok((source_url, updated)) => {
+                                    let _ = evt_tx.send(WorkerEvent::SourceUrlSaved {
+                                        guid,
+                                        source_url,
+                                        updated,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = evt_tx.send(WorkerEvent::Error {
+                                        context: "Save URL".to_owned(),
                                         message: e.to_string(),
                                         was_save: true,
                                     });

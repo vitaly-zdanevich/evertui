@@ -11,7 +11,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
 
 - **Two-panel layout**:
   - **Left panel**: Up to 20 note titles (`j`/`k`, `1`-`9`, mouse click, scroll wheel).
-  - **Right panel**: Note metadata header (Title, Notebook, Tags, Created & Updated dates, size, attachment counts) + **fast native text preview** by default, replacing the preview with **real embedded `vim`** on `Enter` (`:w` saves directly to Evernote with an ASCII animated indicator).
+  - **Right panel**: Note metadata header (Title, Notebook, Tags, Created & Updated dates, size, attachment counts, full source URL) + **fast native text preview** by default, replacing the preview with **real embedded `vim`** on `Enter` (`:w` saves directly to Evernote with an ASCII animated indicator).
 - **Preferences (`p` / `F7` / `Alt+p`)**:
   - `[ ] Vim preview` (unchecked by default for instant browsing; check to preview every selected note directly in embedded `vim`, saved in `~/.config/evertui/preferences.conf`).
 - **Note content strictly in RAM (performance & security)**: Note previews, embedded `vim` buffers, and `:w` save notifications live exclusively in memory (using anonymous Linux kernel `memfd_create` descriptors with swap, backup, undo, and `viminfo` disabled, plus `TMPDIR` pointed at RAM `tmpfs`), so note text never touches `/tmp` or disk.
@@ -23,6 +23,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
 - **Tag & Notebook management**:
   - `t` (`F4` / `Alt+t` / click `[Tags: ...]`) to toggle existing tags or create new tags on a note.
   - `n` (`F5` / `Alt+n` / click `[Notebook: ...]`) to move a note to another notebook.
+  - `u` (`F8` / `Alt+u` / click the URL) to set the note source URL. It stays on one line and is not cut short with `...`. An empty prompt clears it.
 - **Resizable & collapsible panels**:
   - Drag the seam between panels with the mouse to resize panels (resizing `vim`'s PTY live).
   - Press `b` / `F2` / `Alt+b` (or click `<< Hide` / `>> Titles`) to hide or show the left panel.

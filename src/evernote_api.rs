@@ -8,6 +8,7 @@ use crate::search::CompiledEvernoteFilter;
 use evernote::errors::{
     EDAMErrorCode, EDAMNotFoundException, EDAMSystemException, EDAMUserException,
 };
+use evernote::limits::EDAM_ATTRIBUTE_LEN_MAX;
 use evernote::note_store::{
     NoteFilter, NoteStoreSyncClient, NotesMetadataResultSpec, TNoteStoreSyncClient,
 };
@@ -69,6 +70,12 @@ pub trait EvernoteService: Send {
         guid: &NoteGuid,
         new_title: &str,
     ) -> Result<Option<TimestampMs>, ApiError>;
+    fn set_note_source_url(
+        &mut self,
+        guid: &NoteGuid,
+        title: &str,
+        source_url: Option<&str>,
+    ) -> Result<(Option<String>, Option<TimestampMs>), ApiError>;
     fn create_note(
         &mut self,
         title: &str,
@@ -459,6 +466,43 @@ impl EvernoteService for EdamEvernoteService {
         Ok(saved.updated.map(TimestampMs))
     }
 
+    fn set_note_source_url(
+        &mut self,
+        guid: &NoteGuid,
+        title: &str,
+        source_url: Option<&str>,
+    ) -> Result<(Option<String>, Option<TimestampMs>), ApiError> {
+        let normalized = match source_url {
+            Some(raw) => normalize_source_url(raw).map_err(ApiError::Remote)?,
+            None => None,
+        };
+        // updateNote replaces Note.attributes as a whole. Send the current
+        // attributes back with only sourceURL changed.
+        let current = {
+            let token = self.auth.token().to_owned();
+            let mut ns = self.note_store()?;
+            ns.get_note(token, guid.as_str().to_owned(), false, false, false, false)
+                .map_err(map_thrift_error)?
+        };
+        let mut attributes = current.attributes.unwrap_or_default();
+        attributes.source_u_r_l.clone_from(&normalized);
+
+        let token = self.auth.token().to_owned();
+        let mut ns = self.note_store()?;
+        let patch = edam_types::Note {
+            guid: Some(guid.as_str().to_owned()),
+            title: Some(sanitize_title(title)),
+            attributes: Some(attributes),
+            ..Default::default()
+        };
+        let saved = ns.update_note(token, patch).map_err(map_thrift_error)?;
+        let saved_url = match saved.attributes {
+            Some(attrs) => attrs.source_u_r_l,
+            None => normalized,
+        };
+        Ok((saved_url, saved.updated.map(TimestampMs)))
+    }
+
     fn create_note(
         &mut self,
         title: &str,
@@ -489,6 +533,24 @@ impl EvernoteService for EdamEvernoteService {
             resources: Vec::new(),
         })
     }
+}
+
+/// Trim a source URL for Evernote's `sourceURL` attribute.
+/// Empty input clears the URL. Evernote rejects control characters and strings
+/// longer than 4096 UTF-16 code units.
+pub fn normalize_source_url(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("URL cannot contain control characters".to_owned());
+    }
+    let max = usize::try_from(EDAM_ATTRIBUTE_LEN_MAX).unwrap_or(4096);
+    if trimmed.encode_utf16().count() > max {
+        return Err(format!("URL is longer than {max} characters"));
+    }
+    Ok(Some(trimmed.to_owned()))
 }
 
 fn sanitize_title(title: &str) -> String {
@@ -674,4 +736,25 @@ fn format_user_exception(uex: &EDAMUserException) -> String {
         ));
     }
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_source_url;
+
+    #[test]
+    fn normalize_source_url_trims_clears_and_rejects_invalid_values() {
+        assert_eq!(
+            normalize_source_url("  https://music.yandex.com/album/1  ").unwrap(),
+            Some("https://music.yandex.com/album/1".to_owned())
+        );
+        assert_eq!(normalize_source_url("   ").unwrap(), None);
+        assert!(normalize_source_url("http://bad\nurl").is_err());
+        let max = "a".repeat(4096);
+        assert_eq!(
+            normalize_source_url(&max).unwrap().as_deref(),
+            Some(max.as_str())
+        );
+        assert!(normalize_source_url(&"a".repeat(4097)).is_err());
+    }
 }

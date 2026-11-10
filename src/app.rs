@@ -3,6 +3,7 @@ use crate::domain::{
     SearchPage, Tag,
 };
 use crate::enml::PreparedNoteDocument;
+use crate::evernote_api::normalize_source_url;
 use crate::preferences::Preferences;
 use crate::search::ParsedSearch;
 use crate::vim_pane::VimSession;
@@ -182,6 +183,7 @@ impl NotebookPickerModal {
 pub enum PromptKind {
     RenameNote,
     CreateNote,
+    SetSourceUrl,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +315,7 @@ pub struct LayoutGeometry {
     pub title_hit: Rect,
     pub notebook_hit: Rect,
     pub tags_hit: Rect,
+    pub url_hit: Rect,
     pub vim_area: Rect,
     pub modal_area: Option<Rect>,
     pub modal_inner: Option<Rect>,
@@ -725,6 +728,26 @@ impl App {
                 self.remember_current_screen();
                 self.finish_saving("Renamed");
             }
+            WorkerEvent::SourceUrlSaved {
+                guid,
+                source_url,
+                updated,
+            } => {
+                if let Some(detail) = self.note_cache.get_mut(&guid) {
+                    detail.source_url = source_url;
+                    if updated.is_some() {
+                        detail.updated = updated;
+                    }
+                }
+                if let Some(sum) = self.notes.iter_mut().find(|n| n.guid == guid)
+                    && updated.is_some()
+                {
+                    sum.updated = updated;
+                }
+                self.sync_history_note(&guid);
+                self.remember_current_screen();
+                self.finish_saving("URL saved");
+            }
             WorkerEvent::NoteCreated { note } => {
                 let guid = note.guid.clone();
                 let summary = NoteSummary {
@@ -1130,6 +1153,57 @@ impl App {
         });
     }
 
+    pub fn open_source_url_modal(&mut self) {
+        let (note_guid, source_url) = {
+            let Some(detail) = self.selected_detail() else {
+                return;
+            };
+            (
+                detail.guid.clone(),
+                detail.source_url.clone().unwrap_or_default(),
+            )
+        };
+        self.modal = ModalState::TextPrompt(TextPromptModal {
+            kind: PromptKind::SetSourceUrl,
+            note_guid: Some(note_guid),
+            input: TextInput::new(source_url),
+        });
+    }
+
+    fn submit_source_url(&mut self, pm: TextPromptModal) {
+        let Some(guid) = pm.note_guid.clone() else {
+            return;
+        };
+        let normalized = match normalize_source_url(&pm.input.text) {
+            Ok(url) => url,
+            Err(message) => {
+                self.status_error = Some(message);
+                self.modal = ModalState::TextPrompt(pm);
+                return;
+            }
+        };
+        let current = self
+            .note_cache
+            .get(&guid)
+            .and_then(|detail| detail.source_url.clone());
+        if current.as_deref() == normalized.as_deref() {
+            return;
+        }
+        let Some(title) = self
+            .note_cache
+            .get(&guid)
+            .map(|detail| detail.title.clone())
+        else {
+            return;
+        };
+        self.begin_saving("Saving URL");
+        let _ = self.cmd_tx.send(WorkerCommand::SetSourceUrl {
+            guid,
+            title,
+            source_url: normalized,
+        });
+    }
+
     pub fn open_create_note_modal(&mut self) {
         self.modal = ModalState::TextPrompt(TextPromptModal {
             kind: PromptKind::CreateNote,
@@ -1233,6 +1307,14 @@ impl App {
                 self.open_rename_modal();
                 return;
             }
+            KeyCode::F(8) => {
+                self.open_source_url_modal();
+                return;
+            }
+            KeyCode::Char('u') if alt => {
+                self.open_source_url_modal();
+                return;
+            }
             KeyCode::F(7) => {
                 self.open_preferences_modal();
                 return;
@@ -1302,6 +1384,7 @@ impl App {
             KeyCode::Char('t') => self.open_tag_modal(),
             KeyCode::Char('n') => self.open_notebook_modal(),
             KeyCode::Char('r') if !ctrl => self.open_rename_modal(),
+            KeyCode::Char('u') if !ctrl => self.open_source_url_modal(),
             KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
             KeyCode::Char(digit @ '1'..='9')
                 if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -1332,6 +1415,7 @@ impl App {
             KeyCode::Char('t') => self.open_tag_modal(),
             KeyCode::Char('n') => self.open_notebook_modal(),
             KeyCode::Char('r') if !ctrl => self.open_rename_modal(),
+            KeyCode::Char('u') if !ctrl => self.open_source_url_modal(),
             KeyCode::Char('R') => self.execute_search(),
             KeyCode::Char('r') if ctrl => self.execute_search(),
             KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
@@ -1540,38 +1624,40 @@ impl App {
             }
             ModalState::TextPrompt(mut pm) => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Enter => {
-                    let val = pm.input.text.trim().to_owned();
-                    if !val.is_empty() {
-                        match pm.kind {
-                            PromptKind::RenameNote => {
-                                if let Some(guid) = pm.note_guid {
-                                    self.begin_saving("Renaming note");
-                                    let _ = self.cmd_tx.send(WorkerCommand::RenameNote {
-                                        guid,
-                                        new_title: val,
-                                    });
-                                }
-                            }
-                            PromptKind::CreateNote => {
-                                let default_nb = self
-                                    .selected_detail()
-                                    .and_then(|d| d.notebook_guid.clone())
-                                    .or_else(|| {
-                                        self.notebooks
-                                            .iter()
-                                            .find(|nb| nb.is_default)
-                                            .map(|nb| nb.guid.clone())
-                                    });
-                                self.begin_saving("Creating note");
-                                let _ = self.cmd_tx.send(WorkerCommand::CreateNote {
-                                    title: val,
-                                    notebook_guid: default_nb,
-                                });
-                            }
+                KeyCode::Enter => match pm.kind {
+                    PromptKind::SetSourceUrl => self.submit_source_url(pm),
+                    PromptKind::RenameNote => {
+                        let val = pm.input.text.trim().to_owned();
+                        if !val.is_empty()
+                            && let Some(guid) = pm.note_guid
+                        {
+                            self.begin_saving("Renaming note");
+                            let _ = self.cmd_tx.send(WorkerCommand::RenameNote {
+                                guid,
+                                new_title: val,
+                            });
                         }
                     }
-                }
+                    PromptKind::CreateNote => {
+                        let val = pm.input.text.trim().to_owned();
+                        if !val.is_empty() {
+                            let default_nb = self
+                                .selected_detail()
+                                .and_then(|d| d.notebook_guid.clone())
+                                .or_else(|| {
+                                    self.notebooks
+                                        .iter()
+                                        .find(|nb| nb.is_default)
+                                        .map(|nb| nb.guid.clone())
+                                });
+                            self.begin_saving("Creating note");
+                            let _ = self.cmd_tx.send(WorkerCommand::CreateNote {
+                                title: val,
+                                notebook_guid: default_nb,
+                            });
+                        }
+                    }
+                },
                 _ => {
                     pm.input.handle_key(key);
                     self.modal = ModalState::TextPrompt(pm);
@@ -1634,6 +1720,11 @@ impl App {
 
                 if rect_contains(self.geometry.title_hit, col, row) {
                     self.open_rename_modal();
+                    return;
+                }
+
+                if rect_contains(self.geometry.url_hit, col, row) {
+                    self.open_source_url_modal();
                     return;
                 }
 
@@ -2188,6 +2279,111 @@ mod tests {
         });
         assert_eq!(app.active_query, "bbb");
         assert_eq!(app.notes[0].title, "Beta");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sets_and_clears_source_url_from_prompt() {
+        use crate::domain::TimestampMs;
+
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Bootstrap)));
+
+        let mut note = detail("g1");
+        note.title = "Track".to_owned();
+        note.source_url = Some("https://old.example/a".to_owned());
+        app.notes = vec![summary("g1", "Track")];
+        app.note_cache.insert(note.guid.clone(), note);
+        app.loading_list = false;
+
+        let press = |app: &mut App, code: KeyCode| {
+            app.handle_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::empty())));
+        };
+
+        press(&mut app, KeyCode::Char('u'));
+        let ModalState::TextPrompt(pm) = &app.modal else {
+            panic!("expected source URL prompt, got {:?}", app.modal);
+        };
+        assert_eq!(pm.kind, PromptKind::SetSourceUrl);
+        assert_eq!(pm.input.text, "https://old.example/a");
+
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.modal, ModalState::None));
+        assert!(rx.try_recv().is_err());
+
+        press(&mut app, KeyCode::Char('u'));
+        let ModalState::TextPrompt(pm) = &mut app.modal else {
+            panic!("expected source URL prompt");
+        };
+        pm.input = TextInput::new("  https://music.yandex.com/album/1  ");
+        press(&mut app, KeyCode::Enter);
+        match rx.try_recv() {
+            Ok(WorkerCommand::SetSourceUrl {
+                guid,
+                title,
+                source_url,
+            }) => {
+                assert_eq!(guid.0, "g1");
+                assert_eq!(title, "Track");
+                assert_eq!(
+                    source_url.as_deref(),
+                    Some("https://music.yandex.com/album/1")
+                );
+            }
+            other => panic!("expected SetSourceUrl, got {other:?}"),
+        }
+
+        app.handle_worker_event(WorkerEvent::SourceUrlSaved {
+            guid: NoteGuid::from("g1"),
+            source_url: Some("https://music.yandex.com/album/1".to_owned()),
+            updated: Some(TimestampMs(1_762_100_000_000)),
+        });
+        assert_eq!(
+            app.selected_detail()
+                .and_then(|d| d.source_url.clone())
+                .as_deref(),
+            Some("https://music.yandex.com/album/1")
+        );
+        assert_eq!(
+            app.selected_summary().and_then(|summary| summary.updated),
+            Some(TimestampMs(1_762_100_000_000))
+        );
+
+        app.geometry.url_hit = Rect {
+            x: 2,
+            y: 4,
+            width: 20,
+            height: 2,
+        };
+        app.handle_terminal_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        }));
+        let ModalState::TextPrompt(pm) = &mut app.modal else {
+            panic!("click should open source URL prompt");
+        };
+        pm.input.clear();
+        press(&mut app, KeyCode::Enter);
+        match rx.try_recv() {
+            Ok(WorkerCommand::SetSourceUrl { source_url, .. }) => assert_eq!(source_url, None),
+            other => panic!("expected clear, got {other:?}"),
+        };
+
+        press(&mut app, KeyCode::F(8));
+        let ModalState::TextPrompt(pm) = &mut app.modal else {
+            panic!("F8 should open source URL prompt");
+        };
+        pm.input = TextInput::new("http://bad\nurl");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(app.modal, ModalState::TextPrompt(_)));
+        assert!(
+            app.status_error
+                .as_deref()
+                .is_some_and(|err| err.contains("control"))
+        );
         assert!(rx.try_recv().is_err());
     }
 }
