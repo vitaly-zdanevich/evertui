@@ -1,4 +1,4 @@
-use crate::auth::{AuthConfig, DEVELOPER_TOKEN_URL};
+use crate::auth::{AuthConfig, DEVELOPER_TOKEN_URL, default_config_dir};
 use crate::domain::{
     MAX_LEFT_TITLES, NoteDetail, NoteGuid, NoteSummary, Notebook, NotebookGuid, ResourceMeta,
     SearchPage, Tag, TagGuid, TimestampMs,
@@ -15,7 +15,9 @@ use evernote::note_store::{
 use evernote::types as edam_types;
 use evernote::user_store::{TUserStoreSyncClient, UserStoreSyncClient};
 use std::collections::{HashMap, VecDeque};
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use thiserror::Error;
@@ -81,6 +83,8 @@ pub trait EvernoteService: Send {
 pub struct EdamEvernoteService {
     auth: AuthConfig,
     agent: ureq::Agent,
+    /// `~/.config/evertui/note_store_url`, or a test path.
+    cache_path: PathBuf,
     note_store_url: Option<String>,
     cached_tags_by_guid: HashMap<TagGuid, String>,
 }
@@ -106,6 +110,7 @@ impl EdamEvernoteService {
         Self {
             auth,
             agent,
+            cache_path: default_config_dir().join("note_store_url"),
             note_store_url: None,
             cached_tags_by_guid: HashMap::new(),
         }
@@ -119,19 +124,36 @@ impl EdamEvernoteService {
         )
     }
 
-    fn note_store(&mut self) -> Result<NoteStore, ApiError> {
-        let url = if let Some(existing) = &self.note_store_url {
-            existing.clone()
+    /// One NoteStore call. A transport failure drops the cached shard URL, asks
+    /// `getUserUrls` for the current one, and retries the call once.
+    fn call_note_store<T>(
+        &mut self,
+        op: impl Fn(&mut NoteStore) -> thrift::Result<T>,
+    ) -> Result<T, ApiError> {
+        let mut client = self.note_store(true)?;
+        match op(&mut client) {
+            Ok(value) => Ok(value),
+            Err(err) if should_refresh_note_store(&err) => {
+                let mut client = self.note_store(false)?;
+                op(&mut client).map_err(map_thrift_error)
+            }
+            Err(err) => Err(map_thrift_error(err)),
+        }
+    }
+
+    fn note_store(&mut self, allow_disk: bool) -> Result<NoteStore, ApiError> {
+        if !allow_disk {
+            self.note_store_url = None;
+        }
+        let url = if let Some(existing) = self.note_store_url.clone() {
+            existing
+        } else if allow_disk
+            && let Some(cached) = read_note_store_cache(&self.cache_path, &self.auth)
+        {
+            self.note_store_url = Some(cached.clone());
+            cached
         } else {
-            let mut us = self.user_store();
-            let urls = us
-                .get_user_urls(self.auth.token().to_owned())
-                .map_err(map_thrift_error)?;
-            let resolved = urls.note_store_url.ok_or_else(|| {
-                ApiError::Remote("Evernote did not return a NoteStore URL".to_owned())
-            })?;
-            self.note_store_url = Some(resolved.clone());
-            resolved
+            self.resolve_note_store_url()?
         };
 
         let (r, w) = http_halves(&url, self.agent.clone());
@@ -141,10 +163,22 @@ impl EdamEvernoteService {
         ))
     }
 
+    fn resolve_note_store_url(&mut self) -> Result<String, ApiError> {
+        let mut us = self.user_store();
+        let urls = us
+            .get_user_urls(self.auth.token().to_owned())
+            .map_err(map_thrift_error)?;
+        let resolved = urls.note_store_url.ok_or_else(|| {
+            ApiError::Remote("Evernote did not return a NoteStore URL".to_owned())
+        })?;
+        self.note_store_url = Some(resolved.clone());
+        write_note_store_cache(&self.cache_path, &self.auth, &resolved);
+        Ok(resolved)
+    }
+
     fn fetch_tags_internal(&mut self) -> Result<Vec<Tag>, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
-        let raw_tags = ns.list_tags(token).map_err(map_thrift_error)?;
+        let raw_tags = self.call_note_store(|ns| ns.list_tags(token.clone()))?;
         let mut tags: Vec<Tag> = raw_tags
             .into_iter()
             .map(|t| Tag {
@@ -187,8 +221,9 @@ impl EdamEvernoteService {
             }
         }
         let token = self.auth.token().to_owned();
-        if let Ok(mut ns) = self.note_store()
-            && let Ok(fetched) = ns.get_note_tag_names(token, note_guid.as_str().to_owned())
+        let guid = note_guid.as_str().to_owned();
+        if let Ok(fetched) =
+            self.call_note_store(|ns| ns.get_note_tag_names(token.clone(), guid.clone()))
         {
             return fetched;
         }
@@ -199,8 +234,7 @@ impl EdamEvernoteService {
 impl EdamEvernoteService {
     fn list_notebooks_internal(&mut self) -> Result<Vec<Notebook>, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
-        let raw_notebooks = ns.list_notebooks(token).map_err(map_thrift_error)?;
+        let raw_notebooks = self.call_note_store(|ns| ns.list_notebooks(token.clone()))?;
         let mut notebooks: Vec<Notebook> = raw_notebooks
             .into_iter()
             .map(|nb| Notebook {
@@ -231,7 +265,6 @@ impl EvernoteService for EdamEvernoteService {
 
     fn search_notes(&mut self, filter: &CompiledEvernoteFilter) -> Result<SearchPage, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
         let edam_filter = NoteFilter::new(
             Some(edam_types::NoteSortOrder::UPDATED.0),
             None,
@@ -261,9 +294,15 @@ impl EvernoteService for EdamEvernoteService {
             None,
         );
         let max_notes = i32::try_from(MAX_LEFT_TITLES).unwrap_or(20);
-        let result = ns
-            .find_notes_metadata(token, edam_filter, 0, max_notes, spec)
-            .map_err(map_thrift_error)?;
+        let result = self.call_note_store(|ns| {
+            ns.find_notes_metadata(
+                token.clone(),
+                edam_filter.clone(),
+                0,
+                max_notes,
+                spec.clone(),
+            )
+        })?;
 
         let notes = result
             .notes
@@ -293,11 +332,11 @@ impl EvernoteService for EdamEvernoteService {
 
     fn load_note(&mut self, guid: &NoteGuid) -> Result<NoteDetail, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
+        let guid_str = guid.as_str().to_owned();
         // Request note content and resource metadata WITHOUT downloading heavy binary blobs.
-        let raw = ns
-            .get_note(token, guid.as_str().to_owned(), true, false, false, false)
-            .map_err(map_thrift_error)?;
+        let raw = self.call_note_store(|ns| {
+            ns.get_note(token.clone(), guid_str.clone(), true, false, false, false)
+        })?;
 
         let note_guid = NoteGuid(raw.guid.unwrap_or_else(|| guid.0.clone()));
         let tag_guids: Vec<TagGuid> = raw
@@ -342,7 +381,6 @@ impl EvernoteService for EdamEvernoteService {
         enml_content: &str,
     ) -> Result<Option<TimestampMs>, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
         // Leave `resources: None`, `tag_guids: None`, `notebook_guid: None` so Evernote
         // preserves existing binary attachments, tags, and notebook unmodified.
         let patch = edam_types::Note {
@@ -352,7 +390,7 @@ impl EvernoteService for EdamEvernoteService {
             ..Default::default()
         };
 
-        let saved = ns.update_note(token, patch).map_err(map_thrift_error)?;
+        let saved = self.call_note_store(|ns| ns.update_note(token.clone(), patch.clone()))?;
         Ok(saved.updated.map(TimestampMs))
     }
 
@@ -376,7 +414,6 @@ impl EvernoteService for EdamEvernoteService {
         });
 
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
         let (tag_guids, patch_tag_names) = if cleaned.is_empty() {
             // Explicitly clear all tags on the note.
             (Some(Vec::new()), None)
@@ -391,7 +428,7 @@ impl EvernoteService for EdamEvernoteService {
             ..Default::default()
         };
 
-        let saved = ns.update_note(token, patch).map_err(map_thrift_error)?;
+        let saved = self.call_note_store(|ns| ns.update_note(token.clone(), patch.clone()))?;
         let updated_guids: Vec<TagGuid> = saved
             .tag_guids
             .unwrap_or_default()
@@ -426,7 +463,6 @@ impl EvernoteService for EdamEvernoteService {
         notebook_guid: &NotebookGuid,
     ) -> Result<Option<TimestampMs>, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
         let patch = edam_types::Note {
             guid: Some(guid.as_str().to_owned()),
             title: Some(sanitize_title(title)),
@@ -434,7 +470,7 @@ impl EvernoteService for EdamEvernoteService {
             ..Default::default()
         };
 
-        let saved = ns.update_note(token, patch).map_err(map_thrift_error)?;
+        let saved = self.call_note_store(|ns| ns.update_note(token.clone(), patch.clone()))?;
         Ok(saved.updated.map(TimestampMs))
     }
 
@@ -444,14 +480,13 @@ impl EvernoteService for EdamEvernoteService {
         new_title: &str,
     ) -> Result<Option<TimestampMs>, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
         let patch = edam_types::Note {
             guid: Some(guid.as_str().to_owned()),
             title: Some(sanitize_title(new_title)),
             ..Default::default()
         };
 
-        let saved = ns.update_note(token, patch).map_err(map_thrift_error)?;
+        let saved = self.call_note_store(|ns| ns.update_note(token.clone(), patch.clone()))?;
         Ok(saved.updated.map(TimestampMs))
     }
 
@@ -469,22 +504,22 @@ impl EvernoteService for EdamEvernoteService {
         // attributes back with only sourceURL changed.
         let current = {
             let token = self.auth.token().to_owned();
-            let mut ns = self.note_store()?;
-            ns.get_note(token, guid.as_str().to_owned(), false, false, false, false)
-                .map_err(map_thrift_error)?
+            let guid_str = guid.as_str().to_owned();
+            self.call_note_store(|ns| {
+                ns.get_note(token.clone(), guid_str.clone(), false, false, false, false)
+            })?
         };
         let mut attributes = current.attributes.unwrap_or_default();
         attributes.source_u_r_l.clone_from(&normalized);
 
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
         let patch = edam_types::Note {
             guid: Some(guid.as_str().to_owned()),
             title: Some(sanitize_title(title)),
             attributes: Some(attributes),
             ..Default::default()
         };
-        let saved = ns.update_note(token, patch).map_err(map_thrift_error)?;
+        let saved = self.call_note_store(|ns| ns.update_note(token.clone(), patch.clone()))?;
         let saved_url = match saved.attributes {
             Some(attrs) => attrs.source_u_r_l,
             None => normalized,
@@ -498,7 +533,6 @@ impl EvernoteService for EdamEvernoteService {
         notebook_guid: Option<&NotebookGuid>,
     ) -> Result<NoteDetail, ApiError> {
         let token = self.auth.token().to_owned();
-        let mut ns = self.note_store()?;
         let draft = edam_types::Note {
             title: Some(sanitize_title(title)),
             content: Some(enml::empty_enml()),
@@ -506,7 +540,7 @@ impl EvernoteService for EdamEvernoteService {
             ..Default::default()
         };
 
-        let created = ns.create_note(token, draft).map_err(map_thrift_error)?;
+        let created = self.call_note_store(|ns| ns.create_note(token.clone(), draft.clone()))?;
         let guid = NoteGuid(created.guid.unwrap_or_default());
         Ok(NoteDetail {
             guid,
@@ -677,6 +711,96 @@ impl Write for HttpWriteHalf {
     }
 }
 
+/// HTTP and decode failures mean the shard URL may have moved. Evernote
+/// application errors (auth, rate limit, missing note, invalid content) do not.
+fn should_refresh_note_store(err: &thrift::Error) -> bool {
+    matches!(
+        err,
+        thrift::Error::Transport(_) | thrift::Error::Protocol(_)
+    )
+}
+
+fn token_fingerprint(token: &str) -> String {
+    format!("{:x}", md5::compute(token.as_bytes()))
+}
+
+fn read_note_store_cache(path: &Path, auth: &AuthConfig) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let cached = parse_note_store_cache(&text)?;
+    if cached.user_store != auth.user_store_url
+        || cached.token_fp != token_fingerprint(auth.token())
+    {
+        return None;
+    }
+    Some(cached.note_store)
+}
+
+fn write_note_store_cache(path: &Path, auth: &AuthConfig, note_store: &str) {
+    if note_store.contains(|ch: char| ch.is_whitespace()) {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let body = format!(
+        "# Cached Evernote note store. Replaced when this URL stops answering.\n\
+         user_store={}\n\
+         token_fp={}\n\
+         note_store={}\n",
+        auth.user_store_url,
+        token_fingerprint(auth.token()),
+        note_store,
+    );
+    if fs::write(path, body).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+struct ParsedNoteStoreCache {
+    user_store: String,
+    token_fp: String,
+    note_store: String,
+}
+
+fn parse_note_store_cache(text: &str) -> Option<ParsedNoteStoreCache> {
+    let mut user_store = None;
+    let mut token_fp = None;
+    let mut note_store = None;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=')?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match key.trim() {
+            "user_store" => user_store = Some(value.to_owned()),
+            "token_fp" => token_fp = Some(value.to_owned()),
+            "note_store" if value.starts_with("https://") || value.starts_with("http://") => {
+                note_store = Some(value.to_owned());
+            }
+            "note_store" => return None,
+            _ => {}
+        }
+    }
+    Some(ParsedNoteStoreCache {
+        user_store: user_store?,
+        token_fp: token_fp?,
+        note_store: note_store?,
+    })
+}
+
 fn map_thrift_error(err: thrift::Error) -> ApiError {
     if let thrift::Error::User(boxed) = &err {
         if let Some(uex) = boxed.downcast_ref::<EDAMUserException>() {
@@ -729,7 +853,15 @@ fn format_user_exception(uex: &EDAMUserException) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_source_url;
+    use super::{
+        normalize_source_url, parse_note_store_cache, read_note_store_cache,
+        should_refresh_note_store, token_fingerprint, write_note_store_cache,
+    };
+    use crate::auth::AuthConfig;
+    use thrift::{
+        ApplicationError, ApplicationErrorKind, ProtocolError, ProtocolErrorKind, TransportError,
+        TransportErrorKind,
+    };
 
     #[test]
     fn normalize_source_url_trims_clears_and_rejects_invalid_values() {
@@ -745,5 +877,57 @@ mod tests {
             Some(max.as_str())
         );
         assert!(normalize_source_url(&"a".repeat(4097)).is_err());
+    }
+
+    #[test]
+    fn note_store_cache_round_trips_without_storing_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note_store_url");
+        let auth = AuthConfig::new(
+            "S=s1:U=1:secret-token".to_owned(),
+            "https://www.evernote.com/edam/user".to_owned(),
+        );
+        let url = "https://www.evernote.com/shard/s1/notestore";
+        write_note_store_cache(&path, &auth, url);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("secret-token"));
+        assert!(text.contains(&token_fingerprint(auth.token())));
+        assert_eq!(read_note_store_cache(&path, &auth).as_deref(), Some(url));
+
+        let other_account = AuthConfig::new(
+            "other-token".to_owned(),
+            "https://www.evernote.com/edam/user".to_owned(),
+        );
+        assert_eq!(read_note_store_cache(&path, &other_account), None);
+
+        let other_service = AuthConfig::new(
+            "S=s1:U=1:secret-token".to_owned(),
+            "https://app.yinxiang.com/edam/user".to_owned(),
+        );
+        assert_eq!(read_note_store_cache(&path, &other_service), None);
+    }
+
+    #[test]
+    fn note_store_cache_rejects_a_non_url() {
+        let text = "\
+user_store=https://www.evernote.com/edam/user
+token_fp=abc
+note_store=not a url
+";
+        assert!(parse_note_store_cache(text).is_none());
+    }
+
+    #[test]
+    fn refreshes_the_note_store_only_after_a_transport_failure() {
+        assert!(should_refresh_note_store(&thrift::Error::Transport(
+            TransportError::new(TransportErrorKind::Unknown, "HTTP error")
+        )));
+        assert!(should_refresh_note_store(&thrift::Error::Protocol(
+            ProtocolError::new(ProtocolErrorKind::InvalidData, "not thrift")
+        )));
+        assert!(!should_refresh_note_store(&thrift::Error::Application(
+            ApplicationError::new(ApplicationErrorKind::Unknown, "RATE_LIMIT_REACHED")
+        )));
     }
 }

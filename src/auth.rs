@@ -106,6 +106,11 @@ fn config_dir(home: &Path) -> PathBuf {
         .join("evertui")
 }
 
+#[must_use]
+pub fn default_config_dir() -> PathBuf {
+    config_dir(&home_dir())
+}
+
 fn reeknote_dir(home: &Path) -> PathBuf {
     env::var_os("REEKNOTE_APP_DIR")
         .map(PathBuf::from)
