@@ -13,9 +13,7 @@ use evernote::note_store::{
     NoteFilter, NoteStoreSyncClient, NotesMetadataResultSpec, TNoteStoreSyncClient,
 };
 use evernote::types as edam_types;
-use evernote::user_store::{
-    EDAM_VERSION_MAJOR, EDAM_VERSION_MINOR, TUserStoreSyncClient, UserStoreSyncClient,
-};
+use evernote::user_store::{TUserStoreSyncClient, UserStoreSyncClient};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
@@ -30,12 +28,6 @@ pub enum ApiError {
     Remote(String),
 }
 
-pub struct BootstrapData {
-    pub notebooks: Vec<Notebook>,
-    pub tags: Vec<Tag>,
-    pub initial_page: SearchPage,
-}
-
 pub struct UpdatedTagsOutcome {
     pub tag_guids: Vec<TagGuid>,
     pub tag_names: Vec<String>,
@@ -44,7 +36,10 @@ pub struct UpdatedTagsOutcome {
 }
 
 pub trait EvernoteService: Send {
-    fn bootstrap(&mut self) -> Result<BootstrapData, ApiError>;
+    /// Latest notes only. Notebooks and tags are a separate call so the title list
+    /// is not stuck behind `listNotebooks` and `listTags`.
+    fn initial_notes(&mut self) -> Result<SearchPage, ApiError>;
+    fn load_catalog(&mut self) -> Result<(Vec<Notebook>, Vec<Tag>), ApiError>;
     fn search_notes(&mut self, filter: &CompiledEvernoteFilter) -> Result<SearchPage, ApiError>;
     fn load_note(&mut self, guid: &NoteGuid) -> Result<NoteDetail, ApiError>;
     fn save_note_content(
@@ -129,18 +124,6 @@ impl EdamEvernoteService {
             existing.clone()
         } else {
             let mut us = self.user_store();
-            let ok = us
-                .check_version(
-                    concat!("evertui/", env!("CARGO_PKG_VERSION")).to_owned(),
-                    EDAM_VERSION_MAJOR,
-                    EDAM_VERSION_MINOR,
-                )
-                .map_err(map_thrift_error)?;
-            if !ok {
-                return Err(ApiError::Remote(
-                    "Evernote EDAM protocol version rejected by server".to_owned(),
-                ));
-            }
             let urls = us
                 .get_user_urls(self.auth.token().to_owned())
                 .map_err(map_thrift_error)?;
@@ -213,8 +196,8 @@ impl EdamEvernoteService {
     }
 }
 
-impl EvernoteService for EdamEvernoteService {
-    fn bootstrap(&mut self) -> Result<BootstrapData, ApiError> {
+impl EdamEvernoteService {
+    fn list_notebooks_internal(&mut self) -> Result<Vec<Notebook>, ApiError> {
         let token = self.auth.token().to_owned();
         let mut ns = self.note_store()?;
         let raw_notebooks = ns.list_notebooks(token).map_err(map_thrift_error)?;
@@ -228,18 +211,22 @@ impl EvernoteService for EdamEvernoteService {
             })
             .collect();
         notebooks.sort_by_key(|a| a.name.to_lowercase());
+        Ok(notebooks)
+    }
+}
 
-        let tags = self.fetch_tags_internal()?;
-        let initial_page = self.search_notes(&CompiledEvernoteFilter {
+impl EvernoteService for EdamEvernoteService {
+    fn initial_notes(&mut self) -> Result<SearchPage, ApiError> {
+        self.search_notes(&CompiledEvernoteFilter {
             notebook_guid: None,
             words: None,
-        })?;
-
-        Ok(BootstrapData {
-            notebooks,
-            tags,
-            initial_page,
         })
+    }
+
+    fn load_catalog(&mut self) -> Result<(Vec<Notebook>, Vec<Tag>), ApiError> {
+        let notebooks = self.list_notebooks_internal()?;
+        let tags = self.fetch_tags_internal()?;
+        Ok((notebooks, tags))
     }
 
     fn search_notes(&mut self, filter: &CompiledEvernoteFilter) -> Result<SearchPage, ApiError> {
@@ -320,7 +307,9 @@ impl EvernoteService for EdamEvernoteService {
             .map(TagGuid)
             .collect();
         let mut tag_names = raw.tag_names.unwrap_or_default();
-        if tag_names.is_empty() && !tag_guids.is_empty() {
+        // A cold tag cache means startup has not fetched tags yet. Resolving them
+        // here would download the whole tag list before the note body can render.
+        if tag_names.is_empty() && !tag_guids.is_empty() && !self.cached_tags_by_guid.is_empty() {
             tag_names = self.resolve_tag_names(&note_guid, &tag_guids);
         }
 

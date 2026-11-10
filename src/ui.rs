@@ -463,6 +463,7 @@ fn render_note_metadata_header(
             .map(|t| format!("#{t}"))
             .collect::<Vec<_>>()
             .join(" "),
+        Some(d) if !d.tag_guids.is_empty() => format!("{} tag(s)", d.tag_guids.len()),
         Some(_) => "(none)".to_owned(),
         None if !summary.tag_guids.is_empty() => format!("{} tag(s)", summary.tag_guids.len()),
         None => "(none)".to_owned(),

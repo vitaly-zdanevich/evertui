@@ -6,7 +6,7 @@ use evertui::domain::{
     NoteDetail, NoteGuid, NoteSummary, Notebook, NotebookGuid, ResourceMeta, SearchPage, Tag,
     TagGuid, TimestampMs,
 };
-use evertui::evernote_api::{ApiError, BootstrapData, EvernoteService, UpdatedTagsOutcome};
+use evertui::evernote_api::{ApiError, EvernoteService, UpdatedTagsOutcome};
 use evertui::search::CompiledEvernoteFilter;
 use evertui::ui;
 use evertui::worker::BackendHandle;
@@ -29,31 +29,7 @@ struct MockEvernoteService {
 }
 
 impl EvernoteService for MockEvernoteService {
-    fn bootstrap(&mut self) -> Result<BootstrapData, ApiError> {
-        let notebooks = vec![
-            Notebook {
-                guid: NotebookGuid::from("nb-inbox"),
-                name: "INBOX".to_owned(),
-                stack: None,
-                is_default: true,
-            },
-            Notebook {
-                guid: NotebookGuid::from("nb-archive"),
-                name: "Archive".to_owned(),
-                stack: Some("Personal".to_owned()),
-                is_default: false,
-            },
-        ];
-        let tags = vec![
-            Tag {
-                guid: TagGuid::from("tg-1"),
-                name: "Evernote".to_owned(),
-            },
-            Tag {
-                guid: TagGuid::from("tg-2"),
-                name: "tui".to_owned(),
-            },
-        ];
+    fn initial_notes(&mut self) -> Result<SearchPage, ApiError> {
         let notes = (1..=25)
             .map(|i| NoteSummary {
                 guid: NoteGuid(format!("note-{i}")),
@@ -65,14 +41,39 @@ impl EvernoteService for MockEvernoteService {
                 content_length: Some(256),
             })
             .collect();
-        Ok(BootstrapData {
-            notebooks,
-            tags,
-            initial_page: SearchPage {
-                total_matching: 25,
-                notes,
-            },
+        Ok(SearchPage {
+            total_matching: 25,
+            notes,
         })
+    }
+
+    fn load_catalog(&mut self) -> Result<(Vec<Notebook>, Vec<Tag>), ApiError> {
+        Ok((
+            vec![
+                Notebook {
+                    guid: NotebookGuid::from("nb-inbox"),
+                    name: "INBOX".to_owned(),
+                    stack: None,
+                    is_default: true,
+                },
+                Notebook {
+                    guid: NotebookGuid::from("nb-archive"),
+                    name: "Archive".to_owned(),
+                    stack: Some("Personal".to_owned()),
+                    is_default: false,
+                },
+            ],
+            vec![
+                Tag {
+                    guid: TagGuid::from("tg-1"),
+                    name: "Evernote".to_owned(),
+                },
+                Tag {
+                    guid: TagGuid::from("tg-2"),
+                    name: "tui".to_owned(),
+                },
+            ],
+        ))
     }
 
     fn search_notes(&mut self, filter: &CompiledEvernoteFilter) -> Result<SearchPage, ApiError> {
@@ -244,6 +245,8 @@ fn full_tui_workflow_with_placeholders_search_tags_notebook_and_real_vim_save() 
         screen_text = buffer_to_string(terminal.backend().buffer());
         if screen_text.contains("[Image: wireframe.png]")
             && screen_text.contains("[Attachment: notes.pdf]")
+            && screen_text.contains("INBOX")
+            && screen_text.contains("#Evernote #tui")
         {
             break;
         }

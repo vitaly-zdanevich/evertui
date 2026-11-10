@@ -6,9 +6,13 @@ use crate::search::CompiledEvernoteFilter;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
+pub const CATALOG_CONTEXT: &str = "Notebooks and tags";
+
 #[derive(Debug)]
 pub enum WorkerCommand {
     Bootstrap,
+    /// `listNotebooks` and `listTags`. Runs after the first note body so startup can paint.
+    LoadCatalog,
     Search {
         request_id: u64,
         filter: CompiledEvernoteFilter,
@@ -50,6 +54,14 @@ pub enum WorkerCommand {
 
 #[derive(Debug)]
 pub enum WorkerEvent {
+    /// Titles are ready. Notebooks and tags may still be in flight.
+    InitialNotes {
+        page: SearchPage,
+    },
+    CatalogLoaded {
+        notebooks: Vec<Notebook>,
+        tags: Vec<Tag>,
+    },
     Bootstrapped {
         notebooks: Vec<Notebook>,
         tags: Vec<Tag>,
@@ -122,17 +134,25 @@ impl BackendHandle {
                 while let Ok(cmd) = cmd_rx.recv() {
                     match cmd {
                         WorkerCommand::Shutdown => break,
-                        WorkerCommand::Bootstrap => match service.bootstrap() {
-                            Ok(data) => {
-                                let _ = evt_tx.send(WorkerEvent::Bootstrapped {
-                                    notebooks: data.notebooks,
-                                    tags: data.tags,
-                                    page: data.initial_page,
-                                });
+                        WorkerCommand::Bootstrap => match service.initial_notes() {
+                            Ok(page) => {
+                                let _ = evt_tx.send(WorkerEvent::InitialNotes { page });
                             }
                             Err(e) => {
                                 let _ = evt_tx.send(WorkerEvent::Error {
                                     context: "Initial sync".to_owned(),
+                                    message: e.to_string(),
+                                    was_save: false,
+                                });
+                            }
+                        },
+                        WorkerCommand::LoadCatalog => match service.load_catalog() {
+                            Ok((notebooks, tags)) => {
+                                let _ = evt_tx.send(WorkerEvent::CatalogLoaded { notebooks, tags });
+                            }
+                            Err(e) => {
+                                let _ = evt_tx.send(WorkerEvent::Error {
+                                    context: CATALOG_CONTEXT.to_owned(),
                                     message: e.to_string(),
                                     was_save: false,
                                 });

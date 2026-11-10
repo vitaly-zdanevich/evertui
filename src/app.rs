@@ -7,7 +7,7 @@ use crate::evernote_api::normalize_source_url;
 use crate::preferences::Preferences;
 use crate::search::ParsedSearch;
 use crate::vim_pane::VimSession;
-use crate::worker::{WorkerCommand, WorkerEvent};
+use crate::worker::{CATALOG_CONTEXT, WorkerCommand, WorkerEvent};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -351,6 +351,8 @@ pub struct App {
 
     pub notebooks: Vec<Notebook>,
     pub tags: Vec<Tag>,
+    /// Set once `listNotebooks` / `listTags` finish or fail. Until then notebook names stay hidden.
+    catalog_ready: bool,
 
     pub note_cache: HashMap<NoteGuid, NoteDetail>,
     pub prepared_docs: HashMap<NoteGuid, PreparedNoteDocument>,
@@ -410,6 +412,7 @@ impl App {
 
             notebooks: Vec::new(),
             tags: Vec::new(),
+            catalog_ready: false,
 
             note_cache: HashMap::new(),
             prepared_docs: HashMap::new(),
@@ -460,10 +463,14 @@ impl App {
         let Some(g) = guid else {
             return "(Default)".to_owned();
         };
-        self.notebooks
-            .iter()
-            .find(|nb| &nb.guid == g)
-            .map_or_else(|| g.0.clone(), |nb| nb.name.clone())
+        if let Some(nb) = self.notebooks.iter().find(|nb| &nb.guid == g) {
+            return nb.name.clone();
+        }
+        if self.catalog_ready {
+            g.0.clone()
+        } else {
+            "...".to_owned()
+        }
     }
 
     pub fn tick(&mut self) {
@@ -589,13 +596,26 @@ impl App {
 
     pub fn handle_worker_event(&mut self, evt: WorkerEvent) {
         match evt {
+            WorkerEvent::InitialNotes { page } => {
+                self.loading_list = false;
+                self.apply_search_page(page);
+                // Queue the catalog behind the selected note's `LoadNote`, which
+                // `apply_search_page` just sent.
+                let _ = self.cmd_tx.send(WorkerCommand::LoadCatalog);
+            }
+            WorkerEvent::CatalogLoaded { notebooks, tags } => {
+                self.notebooks = notebooks;
+                self.install_tags(tags);
+                self.catalog_ready = true;
+            }
             WorkerEvent::Bootstrapped {
                 notebooks,
                 tags,
                 page,
             } => {
                 self.notebooks = notebooks;
-                self.tags = tags;
+                self.install_tags(tags);
+                self.catalog_ready = true;
                 self.loading_list = false;
                 self.apply_search_page(page);
             }
@@ -782,8 +802,12 @@ impl App {
                 if context == "Search" {
                     self.pending_search_query = None;
                 }
-                self.loading_list = false;
-                self.loading_note_guid = None;
+                if context == CATALOG_CONTEXT {
+                    self.catalog_ready = true;
+                } else {
+                    self.loading_list = false;
+                    self.loading_note_guid = None;
+                }
                 let full = format!("{context}: {message}");
                 if was_save {
                     self.save_indicator = SaveIndicator::Failed {
@@ -795,6 +819,27 @@ impl App {
                 }
             }
         }
+    }
+
+    fn install_tags(&mut self, tags: Vec<Tag>) {
+        for detail in self.note_cache.values_mut() {
+            if detail.tag_guids.is_empty() || detail.tag_names.len() == detail.tag_guids.len() {
+                continue;
+            }
+            let names: Vec<String> = detail
+                .tag_guids
+                .iter()
+                .filter_map(|guid| {
+                    tags.iter()
+                        .find(|tag| &tag.guid == guid)
+                        .map(|tag| tag.name.clone())
+                })
+                .collect();
+            if names.len() == detail.tag_guids.len() {
+                detail.tag_names = names;
+            }
+        }
+        self.tags = tags;
     }
 
     fn apply_search_page(&mut self, mut page: SearchPage) {
@@ -2143,6 +2188,74 @@ mod tests {
         app.execute_search();
         assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Search { .. })));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn shows_titles_and_loads_the_selected_note_before_the_catalog() {
+        use crate::domain::{NotebookGuid, TagGuid};
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Bootstrap)));
+
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![NoteSummary {
+                    guid: NoteGuid::from("g-1"),
+                    title: "Fast".to_owned(),
+                    created: None,
+                    updated: None,
+                    notebook_guid: Some(NotebookGuid::from("nb-1")),
+                    tag_guids: vec![TagGuid::from("tg-1")],
+                    content_length: None,
+                }],
+            },
+        });
+
+        assert!(!app.loading_list);
+        assert_eq!(app.notes[0].title, "Fast");
+        assert_eq!(app.notebook_name(Some(&NotebookGuid::from("nb-1"))), "...");
+        assert_eq!(take_load(&rx), "g-1");
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::LoadCatalog)));
+
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note: NoteDetail {
+                guid: NoteGuid::from("g-1"),
+                title: "Fast".to_owned(),
+                enml: "<en-note><div>body</div></en-note>".to_owned(),
+                created: None,
+                updated: None,
+                notebook_guid: Some(NotebookGuid::from("nb-1")),
+                tag_guids: vec![TagGuid::from("tg-1")],
+                tag_names: Vec::new(),
+                source_url: None,
+                content_length: Some(4),
+                resources: Vec::new(),
+            },
+        });
+        assert!(app.selected_detail().unwrap().tag_names.is_empty());
+
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: vec![Notebook {
+                guid: NotebookGuid::from("nb-1"),
+                name: "INBOX".to_owned(),
+                stack: None,
+                is_default: true,
+            }],
+            tags: vec![Tag {
+                guid: TagGuid::from("tg-1"),
+                name: "work".to_owned(),
+            }],
+        });
+        assert_eq!(
+            app.notebook_name(Some(&NotebookGuid::from("nb-1"))),
+            "INBOX"
+        );
+        assert_eq!(
+            app.selected_detail().unwrap().tag_names,
+            vec!["work".to_owned()]
+        );
     }
 
     fn take_load(rx: &mpsc::Receiver<WorkerCommand>) -> String {
