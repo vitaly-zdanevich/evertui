@@ -146,10 +146,15 @@ impl VimSession {
         };
 
         cmd.arg("-n")
+            // No X server round-trip. Embedded Vim copies through the terminal, not the X clipboard.
+            .arg("-X")
             .arg("-i")
             .arg("NONE")
             .arg("--cmd")
-            .arg("set nobackup nowritebackup noundofile noswapfile t_RV= t_u7= | let g:loaded_confirm_quit=1")
+            // `noloadplugins` skips pack/*/start. Those packages (syntax addons, ALE,
+            // gitgutter) were about a second of startup. vimrc mappings still load.
+            // Empty t_RV/t_u7/t_RB/t_RF means Vim does not wait on terminal replies.
+            .arg("set noloadplugins nobackup nowritebackup noundofile noswapfile t_RV= t_u7= t_RB= t_RF= | let g:loaded_confirm_quit=1")
             .arg("-c")
             .arg("setlocal nobackup nowritebackup noundofile noswapfile filetype=markdown")
             .arg("-c")
@@ -684,8 +689,9 @@ mod tests {
         )
         .expect("should spawn vim in PTY backed by RAM memfd");
 
-        // Wait until Vim renders initial content into the vt100 screen.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Plugin startup used to take about a second. The first screen should be up well before that.
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
         while Instant::now() < deadline {
             session.drain_output();
             if session
@@ -705,6 +711,11 @@ mod tests {
                 .contents()
                 .contains("Initial very long line in RAM only"),
             "Vim screen should display initial markdown"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(700),
+            "Vim took {:?}; embedded startup should skip pack plugins",
+            started.elapsed()
         );
 
         // Verify via /proc/<pid>/fd that the child holds anonymous memfd inodes and zero /tmp files.
