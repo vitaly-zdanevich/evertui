@@ -12,6 +12,7 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroU16;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -79,6 +80,9 @@ pub struct VimSession {
     note_ram_file: File,
     saves_seq_file: File,
     last_saves_len: u64,
+    /// Holds `1` while the buffer has unsaved changes, `0` after `:w` or `u` back to the saved text.
+    /// Empty until the first edit.
+    modified_flag_file: File,
     master_fd: OwnedFd,
     writer: Arc<Mutex<File>>,
     output_rx: Receiver<Vec<u8>>,
@@ -105,17 +109,21 @@ impl VimSession {
             memfd_create(c"evertui-note", MemfdFlags::CLOEXEC).map_err(io::Error::from)?;
         let seq_memfd =
             memfd_create(c"evertui-saves", MemfdFlags::CLOEXEC).map_err(io::Error::from)?;
+        let modified_memfd =
+            memfd_create(c"evertui-modified", MemfdFlags::CLOEXEC).map_err(io::Error::from)?;
 
         let mut note_ram_file = File::from(buf_memfd);
         note_ram_file.write_all(initial_markdown.as_bytes())?;
         note_ram_file.flush()?;
 
         let saves_seq_file = File::from(seq_memfd);
+        let modified_flag_file = File::from(modified_memfd);
 
         let buf_raw_fd = note_ram_file.as_raw_fd();
         let seq_raw_fd = saves_seq_file.as_raw_fd();
         let ram_buf_proc_path = format!("/proc/self/fd/{buf_raw_fd}");
         let ram_seq_proc_path = format!("/proc/self/fd/{seq_raw_fd}");
+        let ram_modified_proc_path = format!("/proc/self/fd/{}", modified_flag_file.as_raw_fd());
 
         let (master_fd, slave_fd) = open_pty_pair(rows, cols)?;
         let reader_fd = master_fd.try_clone()?;
@@ -135,6 +143,13 @@ impl VimSession {
 
         let autocmd = format!(
             "autocmd BufWritePost <buffer> silent! call writefile(['saved'], '{ram_seq_proc_path}', 'a')"
+        );
+        // Vim has no `BufModifiedSet` (that is Neovim), so refresh the flag after every edit
+        // (`u` back to the saved text included) and after `:w`. Without the `a` flag `writefile`
+        // truncates, so the memfd always holds the latest state. `silent!` keeps an older Vim that
+        // lacks one of these events from stopping at a "Press ENTER" prompt.
+        let modified_autocmd = format!(
+            "silent! autocmd TextChanged,TextChangedI,TextChangedP,BufWritePost <buffer> silent! call writefile([&modified ? '1' : '0'], '{ram_modified_proc_path}')"
         );
 
         let mut cmd = if has_setsid() {
@@ -160,7 +175,9 @@ impl VimSession {
             // the markdown syntax, which pulls in HTML and CSS syntax (about 10 of 40 ms).
             .arg("syntax off | setlocal nobackup nowritebackup noundofile noswapfile filetype=markdown")
             .arg("-c")
-            .arg(&autocmd);
+            .arg(&autocmd)
+            .arg("-c")
+            .arg(&modified_autocmd);
 
         if let Some(ram_dir) = ram_tmpdir() {
             cmd.env("TMPDIR", ram_dir);
@@ -194,9 +211,11 @@ impl VimSession {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             fcntl_setfd(&note_ram_file, FdFlags::empty()).map_err(io::Error::from)?;
             fcntl_setfd(&saves_seq_file, FdFlags::empty()).map_err(io::Error::from)?;
+            fcntl_setfd(&modified_flag_file, FdFlags::empty()).map_err(io::Error::from)?;
             let spawn_res = cmd.spawn();
             let _ = fcntl_setfd(&note_ram_file, FdFlags::CLOEXEC);
             let _ = fcntl_setfd(&saves_seq_file, FdFlags::CLOEXEC);
+            let _ = fcntl_setfd(&modified_flag_file, FdFlags::CLOEXEC);
             spawn_res?
         };
 
@@ -229,6 +248,7 @@ impl VimSession {
             note_ram_file,
             saves_seq_file,
             last_saves_len: 0,
+            modified_flag_file,
             master_fd,
             writer,
             output_rx,
@@ -264,6 +284,13 @@ impl VimSession {
         } else {
             None
         }
+    }
+
+    /// Returns `true` while the Vim buffer has changes that `:w` has not saved yet.
+    #[must_use]
+    pub fn has_unsaved_changes(&self) -> bool {
+        let mut flag = [0u8; 1];
+        matches!(self.modified_flag_file.read_at(&mut flag, 0), Ok(1)) && flag[0] == b'1'
     }
 
     /// Returns `true` if the `vim` child process has exited (e.g. `:q` or `:wq`).
@@ -739,8 +766,25 @@ mod tests {
             assert!(saw_memfd, "Child descriptors must include anonymous memfd");
         }
 
-        // 1st save: append a line and execute `:w`
-        session.write_raw(b"GoSaved from real vim\x1b:w\r");
+        assert!(
+            !session.has_unsaved_changes(),
+            "a freshly opened note is unmodified"
+        );
+
+        // Edit without saving: the modified flag must turn on.
+        session.write_raw(b"GoSaved from real vim\x1b");
+        let edit_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < edit_deadline && !session.has_unsaved_changes() {
+            session.drain_output();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            session.has_unsaved_changes(),
+            "an edit without `:w` should be reported as unsaved"
+        );
+
+        // 1st save: `:w`
+        session.write_raw(b":w\r");
 
         let mut first_save = None;
         let save_deadline = Instant::now() + Duration::from_secs(5);
@@ -756,6 +800,15 @@ mod tests {
         let md1 = first_save.expect("`:w` in Vim should trigger BufWritePost save detection");
         assert!(md1.contains("Initial very long line in RAM only"));
         assert!(md1.contains("Saved from real vim"));
+        let clean_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < clean_deadline && session.has_unsaved_changes() {
+            session.drain_output();
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !session.has_unsaved_changes(),
+            "`:w` should clear the unsaved flag"
+        );
 
         // 2nd save: replace entire buffer with shorter content to verify in-RAM truncation on `:w`
         session.write_raw(b"ggdGiShort RAM note\x1b:w\r");

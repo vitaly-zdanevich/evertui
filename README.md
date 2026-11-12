@@ -12,6 +12,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
 - **Two-panel layout**:
   - **Left panel**: Up to 20 note titles (`j`/`k`, `1`-`9`, mouse click, scroll wheel).
   - **Right panel**: Note metadata header (Title, Notebook, Tags, Created & Updated dates, size, attachment counts, full source URL) + **fast native text preview** by default, replacing the preview with **real embedded `vim`** on `Enter` (`:w` saves directly to Evernote with an ASCII animated indicator).
+- **Unsaved edits are never dropped**: while the embedded `vim` buffer has changes not yet saved with `:w`, switching notes, searching, creating a note, and quitting are refused with `Unsaved in Vim: :w save, :q! discard` in the status bar.
 - **Preferences (`p` / `F7` / `Alt+p`)**:
   - `[ ] Vim preview` (unchecked by default for instant browsing; check to preview every selected note directly in embedded `vim`, saved in `~/.config/evertui/preferences.conf`).
 - **Note content strictly in RAM (performance & security)**: Note previews, embedded `vim` buffers, and `:w` save notifications live exclusively in memory (using anonymous Linux kernel `memfd_create` descriptors with swap, backup, undo, and `viminfo` disabled, plus `TMPDIR` pointed at RAM `tmpfs`), so note text never touches `/tmp` or disk.

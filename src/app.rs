@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 const MIN_SAVE_ANIMATION_DURATION: Duration = Duration::from_millis(400);
 const SAVED_BADGE_DURATION: Duration = Duration::from_secs(2);
 const ERROR_BADGE_DURATION: Duration = Duration::from_secs(6);
+/// Fits the status bar's 38 columns.
+pub const UNSAVED_VIM_MESSAGE: &str = "Unsaved in Vim: :w save, :q! discard";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusTarget {
@@ -541,6 +543,16 @@ impl App {
             self.save_markdown_from_vim(&guid, &edited_md);
         }
 
+        // Drop the warning once `:w`, `u` or `:q!` resolved it.
+        if self.status_error.as_deref() == Some(UNSAVED_VIM_MESSAGE)
+            && !self
+                .vim_session
+                .as_ref()
+                .is_some_and(VimSession::has_unsaved_changes)
+        {
+            self.status_error = None;
+        }
+
         if let Some(guid) = exited_guid {
             self.vim_session = None;
             if !self.left_panel_visible {
@@ -943,7 +955,7 @@ impl App {
     }
 
     fn navigate_search_history(&mut self, delta: isize) {
-        if self.search_history.is_empty() {
+        if self.search_history.is_empty() || self.blocked_by_unsaved_vim() {
             return;
         }
         self.remember_current_screen();
@@ -1159,6 +1171,9 @@ impl App {
     }
 
     pub fn execute_search(&mut self) {
+        if self.blocked_by_unsaved_vim() {
+            return;
+        }
         self.remember_current_screen();
         let query = self.search_input.text.trim().to_owned();
         self.pending_search_query = Some(query.clone());
@@ -1275,7 +1290,17 @@ impl App {
         });
     }
 
+    fn request_quit(&mut self) {
+        if !self.blocked_by_unsaved_vim() {
+            self.should_quit = true;
+        }
+    }
+
     pub fn open_create_note_modal(&mut self) {
+        // The new note gets selected, which would close Vim.
+        if self.blocked_by_unsaved_vim() {
+            return;
+        }
         self.modal = ModalState::TextPrompt(TextPromptModal {
             kind: PromptKind::CreateNote,
             note_guid: None,
@@ -1302,7 +1327,7 @@ impl App {
                 {
                     self.ensure_vim_for_note(&guid);
                 }
-            } else if self.focus != FocusTarget::RightVim {
+            } else if self.focus != FocusTarget::RightVim && !self.blocked_by_unsaved_vim() {
                 self.vim_session = None;
             }
         }
@@ -1331,7 +1356,7 @@ impl App {
         // Global shortcuts available even while editing inside real Vim.
         match key.code {
             KeyCode::Char('q') if ctrl => {
-                self.should_quit = true;
+                self.request_quit();
                 return;
             }
             KeyCode::F(1) => {
@@ -1447,7 +1472,7 @@ impl App {
                 }
                 self.focus = FocusTarget::LeftTitles;
             }
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.modal = ModalState::Help,
             KeyCode::Char('p') if !ctrl => self.open_preferences_modal(),
             KeyCode::Char('b') => self.toggle_left_panel(),
@@ -1478,7 +1503,7 @@ impl App {
     fn handle_left_panel_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('?') => self.modal = ModalState::Help,
             KeyCode::Char('p') if !ctrl => self.open_preferences_modal(),
             KeyCode::Char('b') => self.toggle_left_panel(),
@@ -1965,8 +1990,23 @@ impl App {
         self.set_selection(next);
     }
 
+    /// Leaving the note would kill Vim and lose edits not saved with `:w`. Refuses and says why.
+    fn blocked_by_unsaved_vim(&mut self) -> bool {
+        let unsaved = self
+            .vim_session
+            .as_ref()
+            .is_some_and(VimSession::has_unsaved_changes);
+        if unsaved {
+            self.status_error = Some(UNSAVED_VIM_MESSAGE.to_owned());
+        }
+        unsaved
+    }
+
     pub fn set_selection(&mut self, index: usize) {
         if index >= self.notes.len() || index == self.selected_index {
+            return;
+        }
+        if self.blocked_by_unsaved_vim() {
             return;
         }
         self.selected_index = index;
@@ -2328,6 +2368,87 @@ mod tests {
             app.selected_detail().unwrap().tag_names,
             vec!["work".to_owned()]
         );
+    }
+
+    fn wait_for(app: &mut App, what: &str, done: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !done(app) {
+            app.poll_vim_activity();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(done(app), "timed out waiting for {what}");
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn unsaved_vim_edits_block_leaving_the_note_until_saved() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::Bootstrapped {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+            page: SearchPage {
+                total_matching: 2,
+                notes: vec![summary("g-1", "One"), summary("g-2", "Two")],
+            },
+        });
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note: detail("g-1"),
+        });
+        app.open_selected_in_vim();
+        assert!(app.vim_session.is_some());
+
+        // Edit in Vim, then leave it without `:w` (Ctrl+\ moves focus to the titles).
+        app.vim_session
+            .as_ref()
+            .unwrap()
+            .write_raw(b"GoNot saved yet\x1b");
+        wait_for(&mut app, "the unsaved flag", |app| {
+            app.vim_session
+                .as_ref()
+                .is_some_and(VimSession::has_unsaved_changes)
+        });
+        app.handle_terminal_event(key(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        assert_eq!(app.focus, FocusTarget::LeftTitles);
+        while rx.try_recv().is_ok() {}
+
+        app.handle_terminal_event(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            app.selected_index, 0,
+            "j must not switch away from unsaved edits"
+        );
+        assert_eq!(app.status_error.as_deref(), Some(UNSAVED_VIM_MESSAGE));
+
+        app.search_input = TextInput::new("other");
+        app.execute_search();
+        app.handle_terminal_event(alt_arrow(KeyCode::Left));
+        app.handle_terminal_event(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        app.handle_terminal_event(key(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        app.open_create_note_modal();
+        assert!(!app.should_quit);
+        assert!(matches!(app.modal, ModalState::None));
+        assert!(rx.try_recv().is_err(), "no search may be sent");
+        assert!(
+            app.vim_session.is_some(),
+            "Vim with unsaved edits stays alive"
+        );
+
+        // `:w` saves and clears the warning; then switching works again.
+        app.handle_terminal_event(key(KeyCode::Char('l'), KeyModifiers::ALT));
+        app.vim_session.as_ref().unwrap().write_raw(b":w\r");
+        wait_for(&mut app, "the save", |app| {
+            app.vim_session
+                .as_ref()
+                .is_some_and(|vim| !vim.has_unsaved_changes())
+                && app.status_error.is_none()
+        });
+        app.handle_terminal_event(key(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        app.handle_terminal_event(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(app.selected_index, 1);
     }
 
     fn take_load(rx: &mpsc::Receiver<WorkerCommand>) -> String {
