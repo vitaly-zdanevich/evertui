@@ -3,7 +3,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use evertui::app::{App, TextInput};
+use evertui::app::App;
 use evertui::auth::AuthConfig;
 use evertui::evernote_api::EdamEvernoteService;
 use evertui::preferences::Preferences;
@@ -52,11 +52,12 @@ fn try_main() -> Result<(), String> {
 
     let prefs_path = Preferences::default_path();
     let prefs = Preferences::load_or_default(&prefs_path);
-    let mut app = App::with_preferences(backend.cmd_tx.clone(), prefs, Some(prefs_path));
-    if let Some(q) = opts.initial_query {
-        app.search_input = TextInput::new(q);
-        app.execute_search();
-    }
+    let mut app = App::with_preferences(
+        backend.cmd_tx.clone(),
+        prefs,
+        Some(prefs_path),
+        opts.initial_query,
+    );
 
     let run_res = run_event_loop(&mut terminal, &mut app, &backend);
     let _ = restore_terminal(&mut terminal);

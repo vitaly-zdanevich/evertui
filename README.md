@@ -37,6 +37,41 @@ eselect sync --repo vitaly-zdanevich-overlay
 emerge -a evertui
 ```
 
+## Build from source
+
+Requirements: Linux, Rust 1.88 or newer (edition 2024), and `vim` on `PATH` (the right panel runs it).
+
+```sh
+git clone https://github.com/vitaly-zdanevich/evertui
+cd evertui
+cargo build --locked --release
+```
+
+The binary is `target/release/evertui`. To install it into `~/.cargo/bin`:
+
+```sh
+cargo install --locked --path .
+```
+
+## Run from source
+
+Put your Evernote developer token in one of the places listed under **Developer token auth** above, for example:
+
+```sh
+export EVERTUI_DEV_TOKEN='S=s1:U=...'
+```
+
+Then run straight from the checkout. Arguments after `--` go to `evertui`; any words that are not options become the startup search:
+
+```sh
+cargo run --release                     # latest notes
+cargo run --release -- t git            # start with a search for tag "git"
+cargo run --release -- --token '...'    # pass the token directly
+cargo run --release -- --help
+```
+
+Run the tests with `cargo test` (they need `vim` installed).
+
 ## Development
 
 Enable the local Git `pre-commit` hook once per clone so `docs/badges/production-code.svg` and `docs/badges/test-code.svg` regenerate automatically from staged files on every commit:

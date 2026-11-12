@@ -353,6 +353,7 @@ pub struct App {
     pub tags: Vec<Tag>,
     /// Set once `listNotebooks` / `listTags` finish or fail. Until then notebook names stay hidden.
     catalog_ready: bool,
+    catalog_requested: bool,
 
     pub note_cache: HashMap<NoteGuid, NoteDetail>,
     pub prepared_docs: HashMap<NoteGuid, PreparedNoteDocument>,
@@ -384,16 +385,18 @@ pub struct App {
 
 impl App {
     pub fn new(cmd_tx: Sender<WorkerCommand>) -> Self {
-        Self::with_preferences(cmd_tx, Preferences::default(), None)
+        Self::with_preferences(cmd_tx, Preferences::default(), None, None)
     }
 
+    /// With `initial_query`, startup sends only that search and skips the recent-notes
+    /// bootstrap, so the list never flashes notes the user did not ask for.
     pub fn with_preferences(
         cmd_tx: Sender<WorkerCommand>,
         preferences: Preferences,
         preferences_path: Option<PathBuf>,
+        initial_query: Option<String>,
     ) -> Self {
-        let _ = cmd_tx.send(WorkerCommand::Bootstrap);
-        Self {
+        let mut app = Self {
             should_quit: false,
             focus: FocusTarget::LeftTitles,
             modal: ModalState::None,
@@ -413,6 +416,7 @@ impl App {
             notebooks: Vec::new(),
             tags: Vec::new(),
             catalog_ready: false,
+            catalog_requested: false,
 
             note_cache: HashMap::new(),
             prepared_docs: HashMap::new(),
@@ -438,6 +442,24 @@ impl App {
             geometry: LayoutGeometry::default(),
 
             cmd_tx,
+        };
+        match initial_query {
+            Some(query) => {
+                app.search_input = TextInput::new(query);
+                app.execute_search();
+            }
+            None => {
+                let _ = app.cmd_tx.send(WorkerCommand::Bootstrap);
+            }
+        }
+        app
+    }
+
+    /// Sends `LoadCatalog` once, behind the first list's `LoadNote` so the note body comes first.
+    fn request_catalog_once(&mut self) {
+        if !self.catalog_requested {
+            self.catalog_requested = true;
+            let _ = self.cmd_tx.send(WorkerCommand::LoadCatalog);
         }
     }
 
@@ -601,7 +623,7 @@ impl App {
                 self.apply_search_page(page);
                 // Queue the catalog behind the selected note's `LoadNote`, which
                 // `apply_search_page` just sent.
-                let _ = self.cmd_tx.send(WorkerCommand::LoadCatalog);
+                self.request_catalog_once();
             }
             WorkerEvent::CatalogLoaded { notebooks, tags } => {
                 self.notebooks = notebooks;
@@ -616,6 +638,7 @@ impl App {
                 self.notebooks = notebooks;
                 self.install_tags(tags);
                 self.catalog_ready = true;
+                self.catalog_requested = true;
                 self.loading_list = false;
                 self.apply_search_page(page);
             }
@@ -623,6 +646,8 @@ impl App {
                 if request_id == self.latest_search_req {
                     self.loading_list = false;
                     self.apply_search_page(page);
+                    // A startup query skips `Bootstrap`, so the catalog is fetched here.
+                    self.request_catalog_once();
                 }
             }
             WorkerEvent::NoteLoaded { note, .. } => {
@@ -801,6 +826,7 @@ impl App {
             } => {
                 if context == "Search" {
                     self.pending_search_query = None;
+                    self.request_catalog_once();
                 }
                 if context == CATALOG_CONTEXT {
                     self.catalog_ready = true;
@@ -2043,7 +2069,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prefs_file = dir.path().join("preferences.conf");
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::with_preferences(tx, Preferences::default(), Some(prefs_file.clone()));
+        let mut app = App::with_preferences(tx, Preferences::default(), Some(prefs_file.clone()), None);
         assert!(!app.preferences.vim_preview);
 
         // Press `p` -> open Preferences, `Space` -> check "Vim preview", `p` -> close.
@@ -2187,6 +2213,51 @@ mod tests {
 
         app.execute_search();
         assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Search { .. })));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn startup_query_skips_bootstrap_and_searches_first() {
+        let (tx, rx) = mpsc::channel();
+        let mut app =
+            App::with_preferences(tx, Preferences::default(), None, Some("t git".to_owned()));
+        let request_id = match rx.try_recv() {
+            Ok(WorkerCommand::Search { request_id, filter }) => {
+                assert_eq!(filter.words.as_deref(), Some("tag:git"));
+                request_id
+            }
+            other => panic!("expected Search first, got {other:?}"),
+        };
+        assert!(rx.try_recv().is_err());
+        assert!(app.loading_list);
+
+        app.handle_worker_event(WorkerEvent::SearchCompleted {
+            request_id,
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("g-1", "Git notes")],
+            },
+        });
+
+        assert_eq!(app.active_query, "t git");
+        assert_eq!(app.notes[0].title, "Git notes");
+        assert_eq!(take_load(&rx), "g-1");
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::LoadCatalog)));
+
+        // Later searches do not refetch the catalog.
+        app.search_input = TextInput::new("other");
+        app.execute_search();
+        let request_id = match rx.try_recv() {
+            Ok(WorkerCommand::Search { request_id, .. }) => request_id,
+            other => panic!("expected Search, got {other:?}"),
+        };
+        app.handle_worker_event(WorkerEvent::SearchCompleted {
+            request_id,
+            page: SearchPage {
+                total_matching: 0,
+                notes: vec![],
+            },
+        });
         assert!(rx.try_recv().is_err());
     }
 
