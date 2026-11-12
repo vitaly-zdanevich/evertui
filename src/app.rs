@@ -2069,7 +2069,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let prefs_file = dir.path().join("preferences.conf");
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::with_preferences(tx, Preferences::default(), Some(prefs_file.clone()), None);
+        let mut app =
+            App::with_preferences(tx, Preferences::default(), Some(prefs_file.clone()), None);
         assert!(!app.preferences.vim_preview);
 
         // Press `p` -> open Preferences, `Space` -> check "Vim preview", `p` -> close.

@@ -156,7 +156,9 @@ impl VimSession {
             // Empty t_RV/t_u7/t_RB/t_RF means Vim does not wait on terminal replies.
             .arg("set noloadplugins nobackup nowritebackup noundofile noswapfile t_RV= t_u7= t_RB= t_RF= | let g:loaded_confirm_quit=1")
             .arg("-c")
-            .arg("setlocal nobackup nowritebackup noundofile noswapfile filetype=markdown")
+            // `syntax off` first, so setting the filetype loads the markdown ftplugin but not
+            // the markdown syntax, which pulls in HTML and CSS syntax (about 10 of 40 ms).
+            .arg("syntax off | setlocal nobackup nowritebackup noundofile noswapfile filetype=markdown")
             .arg("-c")
             .arg(&autocmd);
 
