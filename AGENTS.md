@@ -1,0 +1,1 @@
+- Run `cargo fmt` before every commit. CI runs `cargo fmt --check` and fails on any diff.
