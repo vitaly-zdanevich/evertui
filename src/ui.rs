@@ -306,10 +306,14 @@ fn render_left_titles_panel(
             .add_modifier(Modifier::BOLD)
     };
 
-    let mut state = ListState::default();
-    state.select(Some(app.selected_index));
+    // Start from last frame's scroll position; ratatui moves it only as far as needed to keep
+    // the selection visible.
+    let mut state = ListState::default()
+        .with_offset(app.geometry.left_titles_offset)
+        .with_selected(Some(app.selected_index));
     let list = List::new(items).highlight_style(highlight_style);
     frame.render_stateful_widget(list, area, &mut state);
+    geom.left_titles_offset = state.offset();
 }
 
 fn render_right_note_panel(
@@ -1185,6 +1189,59 @@ mod tests {
         app.open_preferences_modal();
         terminal.draw(|f| render(f, &mut app)).unwrap();
         assert_pure_ascii_and_ansi16(terminal.backend().buffer());
+    }
+
+    #[test]
+    fn title_list_keeps_its_scroll_position_and_clicks_hit_the_shown_note() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        let notes = (0..20)
+            .map(|i| NoteSummary {
+                guid: format!("g{i}").into(),
+                title: format!("Note {i}"),
+                created: None,
+                updated: None,
+                notebook_guid: None,
+                tag_guids: Vec::new(),
+                content_length: None,
+            })
+            .collect();
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 20,
+                notes,
+            },
+        });
+
+        // A short terminal: fewer rows than the 20 titles.
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        app.set_selection(18);
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let inner = app.geometry.left_titles_inner.expect("left panel visible");
+        assert!(usize::from(inner.height) < 20);
+        let offset = app.geometry.left_titles_offset;
+        assert!(offset > 0, "selecting note 18 must scroll the list");
+
+        // One step up stays inside the view, so the list must not scroll.
+        app.set_selection(17);
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        assert_eq!(app.geometry.left_titles_offset, offset);
+
+        // The top row shows note `offset`; clicking it selects that note, not note 0.
+        let top_row: String = (inner.x..inner.x + inner.width)
+            .map(|x| terminal.backend().buffer()[(x, inner.y)].symbol())
+            .collect();
+        assert!(
+            top_row.starts_with(&format!("Note {offset}")),
+            "{top_row:?}"
+        );
+        app.handle_terminal_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + 1,
+            row: inner.y,
+            modifiers: KeyModifiers::empty(),
+        }));
+        assert_eq!(app.selected_index, offset);
     }
 
     #[test]

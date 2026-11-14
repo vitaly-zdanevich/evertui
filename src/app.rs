@@ -315,6 +315,9 @@ pub struct LayoutGeometry {
     pub toggle_left_btn: Rect,
     pub search_bar: Rect,
     pub left_titles_inner: Option<Rect>,
+    /// First title row shown. Kept across frames so the list scrolls only when the
+    /// selection leaves the view, and so clicks map to the right note.
+    pub left_titles_offset: usize,
     pub separator_x: Option<u16>,
     pub split_y_range: (u16, u16),
     pub title_hit: Rect,
@@ -1812,7 +1815,8 @@ impl App {
                     && rect_contains(list_area, col, row)
                 {
                     self.focus = FocusTarget::LeftTitles;
-                    let clicked_idx = usize::from(row - list_area.y);
+                    let clicked_idx =
+                        self.geometry.left_titles_offset + usize::from(row - list_area.y);
                     if clicked_idx < self.notes.len() {
                         self.set_selection(clicked_idx);
                     }
