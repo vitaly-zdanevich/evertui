@@ -31,6 +31,9 @@ const SAVE_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(30),
     Duration::from_secs(60),
 ];
+/// Shown after the first `q` while saves are still on their way to Evernote.
+pub const QUIT_AFTER_SYNC_MESSAGE: &str = "Saving first; q again: quit, lose it";
+
 /// Fits the status bar's 38 columns.
 pub const UNSAVED_VIM_MESSAGE: &str = "Unsaved in Vim: :w save, :q! discard";
 
@@ -399,6 +402,8 @@ pub struct App {
     pub anim_tick: usize,
     pub status_error: Option<String>,
     unsynced: HashMap<NoteGuid, UnsyncedNote>,
+    /// `q` was pressed while saves were pending: quit as soon as they land.
+    quit_after_sync: bool,
 
     pub preferences: Preferences,
     pub preferences_path: Option<PathBuf>,
@@ -463,6 +468,7 @@ impl App {
             anim_tick: 0,
             status_error: None,
             unsynced: HashMap::new(),
+            quit_after_sync: false,
 
             preferences,
             preferences_path,
@@ -818,6 +824,9 @@ impl App {
                     .is_some_and(|note| note.enml == saved_enml)
                 {
                     self.unsynced.remove(&guid);
+                }
+                if self.quit_after_sync && self.unsynced.is_empty() {
+                    self.should_quit = true;
                 }
             }
             WorkerEvent::SaveFailed {
@@ -1427,10 +1436,17 @@ impl App {
         });
     }
 
+    /// Quits now, or once pending saves reach Evernote. A second `q` quits anyway.
     fn request_quit(&mut self) {
-        if !self.blocked_by_unsaved_vim() {
-            self.should_quit = true;
+        if self.blocked_by_unsaved_vim() {
+            return;
         }
+        if self.unsynced.is_empty() || self.quit_after_sync {
+            self.should_quit = true;
+            return;
+        }
+        self.quit_after_sync = true;
+        self.status_error = Some(QUIT_AFTER_SYNC_MESSAGE.to_owned());
     }
 
     pub fn open_create_note_modal(&mut self) {
@@ -2733,6 +2749,35 @@ mod tests {
             updated: None,
         });
         assert_eq!(app.unsynced_count(), 0);
+    }
+
+    #[test]
+    fn quit_waits_for_pending_saves_and_second_q_quits_anyway() {
+        let (mut app, rx, guid, md) = app_with_loaded_note();
+        app.save_markdown_from_vim(&guid, &format!("{md}\nmore\n"));
+        let enml = take_save(&rx);
+
+        app.handle_terminal_event(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        assert_eq!(app.status_error.as_deref(), Some(QUIT_AFTER_SYNC_MESSAGE));
+        app.handle_worker_event(WorkerEvent::ContentSaved {
+            guid: guid.clone(),
+            enml: enml.clone(),
+            updated: None,
+        });
+        assert!(app.should_quit, "quits once the save landed");
+
+        let (mut app, rx, guid, md) = app_with_loaded_note();
+        app.save_markdown_from_vim(&guid, &format!("{md}\nmore\n"));
+        let enml = take_save(&rx);
+        fail_save(&mut app, &guid, &enml, SaveRetry::Backoff);
+        app.handle_terminal_event(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(!app.should_quit);
+        app.handle_terminal_event(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(
+            app.should_quit,
+            "second q quits even though the save failed"
+        );
     }
 
     fn take_load(rx: &mpsc::Receiver<WorkerCommand>) -> String {
