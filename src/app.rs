@@ -606,6 +606,20 @@ impl App {
             self.prepared_docs.get(guid).cloned().unwrap_or_else(|| {
                 PreparedNoteDocument::from_enml(&detail.enml, &detail.resources)
             });
+        // `:w` without edits would still turn the Markdown back into ENML and upload it,
+        // which can change formatting the round trip does not keep. Vim adds a final newline.
+        let unchanged = edited_md.strip_suffix('\n').unwrap_or(edited_md)
+            == prepared
+                .markdown
+                .strip_suffix('\n')
+                .unwrap_or(&prepared.markdown);
+        if unchanged {
+            self.save_indicator = SaveIndicator::Saved {
+                label: "No changes".to_owned(),
+                until: Instant::now() + SAVED_BADGE_DURATION,
+            };
+            return;
+        }
         let new_enml = prepared.to_enml(edited_md);
 
         // Update local prepared markdown snapshot immediately so subsequent re-opens reflect edits.
@@ -2477,6 +2491,40 @@ mod tests {
         app.handle_terminal_event(key(KeyCode::Char('\\'), KeyModifiers::CONTROL));
         app.handle_terminal_event(key(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.selected_index, 1);
+    }
+
+    fn app_with_loaded_note() -> (App, mpsc::Receiver<WorkerCommand>, NoteGuid, String) {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("g-1", "One")],
+            },
+        });
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note: detail("g-1"),
+        });
+        while rx.try_recv().is_ok() {}
+        let guid = NoteGuid::from("g-1");
+        let md = app.prepared_docs[&guid].markdown.clone();
+        (app, rx, guid, md)
+    }
+
+    #[test]
+    fn write_without_edits_is_not_uploaded() {
+        let (mut app, rx, guid, md) = app_with_loaded_note();
+        // Vim writes the buffer back, adding a final newline only when it is missing.
+        assert!(md.ends_with('\n'));
+        app.save_markdown_from_vim(&guid, &md);
+        assert!(rx.try_recv().is_err(), "nothing may be sent to Evernote");
+        app.save_markdown_from_vim(&guid, md.trim_end_matches('\n'));
+        assert!(rx.try_recv().is_err(), "nothing may be sent to Evernote");
+        assert!(matches!(
+            &app.save_indicator,
+            SaveIndicator::Saved { label, .. } if label == "No changes"
+        ));
     }
 
     fn take_load(rx: &mpsc::Receiver<WorkerCommand>) -> String {
