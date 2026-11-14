@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 pub const CATALOG_CONTEXT: &str = "Notebooks and tags";
+pub const INITIAL_SYNC_CONTEXT: &str = "Initial sync";
 
 #[derive(Debug)]
 pub enum WorkerCommand {
@@ -78,6 +79,11 @@ pub enum WorkerEvent {
     SearchCompleted {
         request_id: u64,
         page: SearchPage,
+    },
+    /// Carries the request id so a failure of an older search is not taken for the latest.
+    SearchFailed {
+        request_id: u64,
+        message: String,
     },
     NoteLoaded {
         request_id: u64,
@@ -184,7 +190,7 @@ impl BackendHandle {
                             }
                             Err(e) => {
                                 evt_tx.send(WorkerEvent::Error {
-                                    context: "Initial sync".to_owned(),
+                                    context: INITIAL_SYNC_CONTEXT.to_owned(),
                                     message: e.to_string(),
                                     was_save: false,
                                 });
@@ -208,10 +214,9 @@ impl BackendHandle {
                                     evt_tx.send(WorkerEvent::SearchCompleted { request_id, page });
                                 }
                                 Err(e) => {
-                                    evt_tx.send(WorkerEvent::Error {
-                                        context: "Search".to_owned(),
+                                    evt_tx.send(WorkerEvent::SearchFailed {
+                                        request_id,
                                         message: e.to_string(),
-                                        was_save: false,
                                     });
                                 }
                             }

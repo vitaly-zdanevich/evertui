@@ -8,7 +8,7 @@ use crate::preferences::Preferences;
 use crate::search::ParsedSearch;
 use crate::vim_pane::VimSession;
 use crate::wake::Waker;
-use crate::worker::{CATALOG_CONTEXT, SaveRetry, WorkerCommand, WorkerEvent};
+use crate::worker::{CATALOG_CONTEXT, INITIAL_SYNC_CONTEXT, SaveRetry, WorkerCommand, WorkerEvent};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -1104,20 +1104,30 @@ impl App {
                 self.remember_current_screen();
                 self.finish_saving("Created");
             }
+            WorkerEvent::SearchFailed {
+                request_id,
+                message,
+            } => {
+                // An older search failing says nothing about the one on screen or on its way.
+                if request_id == self.latest_search_req {
+                    self.pending_search_query = None;
+                    self.loading_list = false;
+                    self.status_error = Some(format!("Search: {message}"));
+                    // A startup query skips `Bootstrap`, so the catalog is fetched here too.
+                    self.request_catalog_once();
+                }
+            }
             WorkerEvent::Error {
                 context,
                 message,
                 was_save,
             } => {
-                if context == "Search" {
-                    self.pending_search_query = None;
-                    self.request_catalog_once();
-                }
+                // Only reset state owned by the failed request: a failed tag save must not end
+                // the loading state of a search or a note load running meanwhile.
                 if context == CATALOG_CONTEXT {
                     self.catalog_ready = true;
-                } else {
+                } else if context == INITIAL_SYNC_CONTEXT {
                     self.loading_list = false;
-                    self.loading_note_guid = None;
                 }
                 let full = format!("{context}: {message}");
                 if was_save {
@@ -2944,6 +2954,53 @@ mod tests {
             panic!("tag editor should open once every name is known");
         };
         assert_eq!(editor.selected_tags, ["work", "home"]);
+    }
+
+    #[test]
+    fn only_the_latest_search_failure_counts() {
+        let (mut app, rx, _guid, _md) = app_with_loaded_note();
+        app.search_input = TextInput::new("old");
+        app.execute_search();
+        let old_req = app.latest_search_req;
+        app.search_input = TextInput::new("new");
+        app.execute_search();
+        let new_req = app.latest_search_req;
+        while rx.try_recv().is_ok() {}
+
+        // The old search fails after the new one was sent.
+        app.handle_worker_event(WorkerEvent::SearchFailed {
+            request_id: old_req,
+            message: "boom".to_owned(),
+        });
+        assert!(app.loading_list, "the new search is still loading");
+        assert_eq!(app.status_error, None);
+        // A failed tag save meanwhile does not end it either.
+        app.handle_worker_event(WorkerEvent::Error {
+            context: "Save tags".to_owned(),
+            message: "boom".to_owned(),
+            was_save: true,
+        });
+        assert!(app.loading_list);
+
+        app.handle_worker_event(WorkerEvent::SearchCompleted {
+            request_id: new_req,
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("g-9", "Found")],
+            },
+        });
+        assert_eq!(app.active_query, "new", "the new query is applied");
+        assert_eq!(app.search_input.text, "new");
+
+        // The latest search failing is reported and ends the loading state.
+        app.search_input = TextInput::new("again");
+        app.execute_search();
+        app.handle_worker_event(WorkerEvent::SearchFailed {
+            request_id: app.latest_search_req,
+            message: "boom".to_owned(),
+        });
+        assert!(!app.loading_list);
+        assert_eq!(app.status_error.as_deref(), Some("Search: boom"));
     }
 
     fn app_with_loaded_note() -> (App, mpsc::Receiver<WorkerCommand>, NoteGuid, String) {
