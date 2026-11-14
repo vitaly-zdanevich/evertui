@@ -3,6 +3,7 @@ use crate::domain::{
 };
 use crate::evernote_api::EvernoteService;
 use crate::search::CompiledEvernoteFilter;
+use crate::wake::Waker;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
@@ -118,10 +119,32 @@ pub struct BackendHandle {
     join_handle: Option<JoinHandle<()>>,
 }
 
+/// Sends a worker event and wakes the UI loop to handle it.
+struct EventSender {
+    tx: Sender<WorkerEvent>,
+    waker: Waker,
+}
+
+impl EventSender {
+    /// A closed channel means the UI is gone, so there is nobody left to tell.
+    fn send(&self, evt: WorkerEvent) {
+        if self.tx.send(evt).is_ok() {
+            self.waker.wake();
+        }
+    }
+}
+
 impl BackendHandle {
-    pub fn spawn(mut service: Box<dyn EvernoteService>) -> Self {
+    /// For callers that poll `evt_rx` on their own, such as tests.
+    pub fn spawn(service: Box<dyn EvernoteService>) -> Self {
+        Self::spawn_with_waker(service, Waker::noop())
+    }
+
+    /// `waker` runs after every event, so the UI loop can block until one arrives.
+    pub fn spawn_with_waker(mut service: Box<dyn EvernoteService>, waker: Waker) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
-        let (evt_tx, evt_rx) = mpsc::channel::<WorkerEvent>();
+        let (tx, evt_rx) = mpsc::channel::<WorkerEvent>();
+        let evt_tx = EventSender { tx, waker };
 
         let handle = thread::Builder::new()
             .name("evertui-evernote-worker".to_owned())
@@ -131,10 +154,10 @@ impl BackendHandle {
                         WorkerCommand::Shutdown => break,
                         WorkerCommand::Bootstrap => match service.initial_notes() {
                             Ok(page) => {
-                                let _ = evt_tx.send(WorkerEvent::InitialNotes { page });
+                                evt_tx.send(WorkerEvent::InitialNotes { page });
                             }
                             Err(e) => {
-                                let _ = evt_tx.send(WorkerEvent::Error {
+                                evt_tx.send(WorkerEvent::Error {
                                     context: "Initial sync".to_owned(),
                                     message: e.to_string(),
                                     was_save: false,
@@ -143,10 +166,10 @@ impl BackendHandle {
                         },
                         WorkerCommand::LoadCatalog => match service.load_catalog() {
                             Ok((notebooks, tags)) => {
-                                let _ = evt_tx.send(WorkerEvent::CatalogLoaded { notebooks, tags });
+                                evt_tx.send(WorkerEvent::CatalogLoaded { notebooks, tags });
                             }
                             Err(e) => {
-                                let _ = evt_tx.send(WorkerEvent::Error {
+                                evt_tx.send(WorkerEvent::Error {
                                     context: CATALOG_CONTEXT.to_owned(),
                                     message: e.to_string(),
                                     was_save: false,
@@ -156,11 +179,10 @@ impl BackendHandle {
                         WorkerCommand::Search { request_id, filter } => {
                             match service.search_notes(&filter) {
                                 Ok(page) => {
-                                    let _ = evt_tx
-                                        .send(WorkerEvent::SearchCompleted { request_id, page });
+                                    evt_tx.send(WorkerEvent::SearchCompleted { request_id, page });
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::Error {
+                                    evt_tx.send(WorkerEvent::Error {
                                         context: "Search".to_owned(),
                                         message: e.to_string(),
                                         was_save: false,
@@ -171,11 +193,10 @@ impl BackendHandle {
                         WorkerCommand::LoadNote { request_id, guid } => {
                             match service.load_note(&guid) {
                                 Ok(note) => {
-                                    let _ =
-                                        evt_tx.send(WorkerEvent::NoteLoaded { request_id, note });
+                                    evt_tx.send(WorkerEvent::NoteLoaded { request_id, note });
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::NoteLoadFailed {
+                                    evt_tx.send(WorkerEvent::NoteLoadFailed {
                                         request_id,
                                         guid,
                                         message: e.to_string(),
@@ -186,14 +207,14 @@ impl BackendHandle {
                         WorkerCommand::SaveContent { guid, title, enml } => {
                             match service.save_note_content(&guid, &title, &enml) {
                                 Ok(updated) => {
-                                    let _ = evt_tx.send(WorkerEvent::ContentSaved {
+                                    evt_tx.send(WorkerEvent::ContentSaved {
                                         guid,
                                         enml,
                                         updated,
                                     });
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::Error {
+                                    evt_tx.send(WorkerEvent::Error {
                                         context: "Save note".to_owned(),
                                         message: e.to_string(),
                                         was_save: true,
@@ -207,7 +228,7 @@ impl BackendHandle {
                             tag_names,
                         } => match service.set_note_tags(&guid, &title, &tag_names) {
                             Ok(outcome) => {
-                                let _ = evt_tx.send(WorkerEvent::TagsSaved {
+                                evt_tx.send(WorkerEvent::TagsSaved {
                                     guid,
                                     tag_guids: outcome.tag_guids,
                                     tag_names: outcome.tag_names,
@@ -216,7 +237,7 @@ impl BackendHandle {
                                 });
                             }
                             Err(e) => {
-                                let _ = evt_tx.send(WorkerEvent::Error {
+                                evt_tx.send(WorkerEvent::Error {
                                     context: "Save tags".to_owned(),
                                     message: e.to_string(),
                                     was_save: true,
@@ -229,14 +250,14 @@ impl BackendHandle {
                             notebook_guid,
                         } => match service.set_note_notebook(&guid, &title, &notebook_guid) {
                             Ok(updated) => {
-                                let _ = evt_tx.send(WorkerEvent::NotebookSaved {
+                                evt_tx.send(WorkerEvent::NotebookSaved {
                                     guid,
                                     notebook_guid,
                                     updated,
                                 });
                             }
                             Err(e) => {
-                                let _ = evt_tx.send(WorkerEvent::Error {
+                                evt_tx.send(WorkerEvent::Error {
                                     context: "Set notebook".to_owned(),
                                     message: e.to_string(),
                                     was_save: true,
@@ -246,14 +267,14 @@ impl BackendHandle {
                         WorkerCommand::RenameNote { guid, new_title } => {
                             match service.rename_note(&guid, &new_title) {
                                 Ok(updated) => {
-                                    let _ = evt_tx.send(WorkerEvent::NoteRenamed {
+                                    evt_tx.send(WorkerEvent::NoteRenamed {
                                         guid,
                                         new_title,
                                         updated,
                                     });
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::Error {
+                                    evt_tx.send(WorkerEvent::Error {
                                         context: "Rename note".to_owned(),
                                         message: e.to_string(),
                                         was_save: true,
@@ -269,14 +290,14 @@ impl BackendHandle {
                             match service.set_note_source_url(&guid, &title, source_url.as_deref())
                             {
                                 Ok((source_url, updated)) => {
-                                    let _ = evt_tx.send(WorkerEvent::SourceUrlSaved {
+                                    evt_tx.send(WorkerEvent::SourceUrlSaved {
                                         guid,
                                         source_url,
                                         updated,
                                     });
                                 }
                                 Err(e) => {
-                                    let _ = evt_tx.send(WorkerEvent::Error {
+                                    evt_tx.send(WorkerEvent::Error {
                                         context: "Save URL".to_owned(),
                                         message: e.to_string(),
                                         was_save: true,
@@ -289,10 +310,10 @@ impl BackendHandle {
                             notebook_guid,
                         } => match service.create_note(&title, notebook_guid.as_ref()) {
                             Ok(note) => {
-                                let _ = evt_tx.send(WorkerEvent::NoteCreated { note });
+                                evt_tx.send(WorkerEvent::NoteCreated { note });
                             }
                             Err(e) => {
-                                let _ = evt_tx.send(WorkerEvent::Error {
+                                evt_tx.send(WorkerEvent::Error {
                                     context: "Create note".to_owned(),
                                     message: e.to_string(),
                                     was_save: true,

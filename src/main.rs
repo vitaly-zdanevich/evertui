@@ -1,4 +1,4 @@
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -8,12 +8,25 @@ use evertui::auth::AuthConfig;
 use evertui::evernote_api::EdamEvernoteService;
 use evertui::preferences::Preferences;
 use evertui::ui;
+use evertui::wake::Waker;
 use evertui::worker::BackendHandle;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io::{self, Stdout};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::Instant;
+
+/// Everything that can wake the UI loop. It sleeps until one arrives.
+enum LoopEvent {
+    Terminal(Event),
+    TerminalFailed(io::Error),
+    /// The Evernote worker or Vim has news; details are read from their own channels.
+    Wake,
+}
 
 struct CliOptions {
     token: Option<String>,
@@ -45,7 +58,9 @@ fn try_main() -> Result<(), String> {
 
     let auth = AuthConfig::resolve(opts.token).map_err(|e| e.to_string())?;
     let service = Box::new(EdamEvernoteService::new(auth));
-    let backend = BackendHandle::spawn(service);
+    let (loop_tx, loop_rx) = mpsc::channel::<LoopEvent>();
+    let (waker, wake_pending) = coalescing_waker(loop_tx.clone());
+    let backend = BackendHandle::spawn_with_waker(service, waker.clone());
 
     install_panic_hook();
     let mut terminal = setup_terminal().map_err(|e| format!("Terminal init failed: {e}"))?;
@@ -58,51 +73,99 @@ fn try_main() -> Result<(), String> {
         Some(prefs_path),
         opts.initial_query,
     );
+    app.set_waker(waker);
+    spawn_terminal_reader(loop_tx).map_err(|e| format!("Input thread failed: {e}"))?;
 
-    let run_res = run_event_loop(&mut terminal, &mut app, &backend);
+    let run_res = run_event_loop(&mut terminal, &mut app, &backend, &loop_rx, &wake_pending);
     let _ = restore_terminal(&mut terminal);
 
     run_res.map_err(|e| format!("Runtime I/O error: {e}"))
 }
 
+/// Sends at most one `Wake` until the loop picks it up, so a burst of Vim output or worker
+/// events costs one loop pass, not one per chunk.
+/// The flag says a `Wake` is already queued; the loop clears it before reading the sources.
+fn coalescing_waker(tx: Sender<LoopEvent>) -> (Waker, Arc<AtomicBool>) {
+    let pending = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&pending);
+    let waker = Waker::new(move || {
+        if !flag.swap(true, Ordering::AcqRel) {
+            let _ = tx.send(LoopEvent::Wake);
+        }
+    });
+    (waker, pending)
+}
+
+fn spawn_terminal_reader(tx: Sender<LoopEvent>) -> io::Result<()> {
+    thread::Builder::new()
+        .name("evertui-terminal-input".to_owned())
+        .spawn(move || {
+            loop {
+                let msg = match event::read() {
+                    Ok(ev) => LoopEvent::Terminal(ev),
+                    Err(e) => LoopEvent::TerminalFailed(e),
+                };
+                let failed = matches!(msg, LoopEvent::TerminalFailed(_));
+                if tx.send(msg).is_err() || failed {
+                    break;
+                }
+            }
+        })
+        .map(drop)
+}
+
+/// Sleeps until input, a worker event, Vim output or exit, or a timer the app asked for
+/// (`App::next_deadline`), then applies everything pending and draws once.
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     backend: &BackendHandle,
+    loop_rx: &Receiver<LoopEvent>,
+    wake_pending: &AtomicBool,
 ) -> io::Result<()> {
-    let tick_rate = Duration::from_millis(50);
-    let mut last_tick = Instant::now();
-
-    while !app.should_quit {
+    loop {
+        // Clear before reading the sources, so news that lands meanwhile sends a fresh `Wake`.
+        wake_pending.store(false, Ordering::Release);
         while let Ok(evt) = backend.evt_rx.try_recv() {
             app.handle_worker_event(evt);
         }
         app.poll_vim_activity();
+        if app
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            app.tick();
+        }
+        if app.should_quit {
+            return Ok(());
+        }
 
         terminal.draw(|frame| ui::render(frame, app))?;
 
-        let timeout = if app.save_indicator.is_animating() || app.loading_list {
-            Duration::from_millis(50)
-        } else {
-            Duration::from_millis(25)
+        let first = match app.next_deadline() {
+            Some(deadline) => {
+                match loop_rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(msg) => Some(msg),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+            }
+            None => match loop_rx.recv() {
+                Ok(msg) => Some(msg),
+                Err(_) => return Ok(()),
+            },
         };
-
-        if event::poll(timeout)? {
-            let ev = event::read()?;
-            app.handle_terminal_event(ev);
-            while event::poll(Duration::ZERO)? {
-                let next_ev = event::read()?;
-                app.handle_terminal_event(next_ev);
+        for msg in first
+            .into_iter()
+            .chain(std::iter::from_fn(|| loop_rx.try_recv().ok()))
+        {
+            match msg {
+                LoopEvent::Terminal(ev) => app.handle_terminal_event(ev),
+                LoopEvent::TerminalFailed(e) => return Err(e),
+                LoopEvent::Wake => {}
             }
         }
-
-        if last_tick.elapsed() >= tick_rate {
-            app.tick();
-            last_tick = Instant::now();
-        }
     }
-
-    Ok(())
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {

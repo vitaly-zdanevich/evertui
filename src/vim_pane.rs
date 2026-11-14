@@ -1,11 +1,13 @@
 use crate::domain::NoteGuid;
+use crate::wake::Waker;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use rustix::fd::OwnedFd;
 use rustix::fs::{MemfdFlags, memfd_create};
-use rustix::io::{FdFlags, fcntl_setfd};
+use rustix::io::{Errno, FdFlags, fcntl_setfd};
+use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 use std::fs::File;
@@ -99,6 +101,7 @@ impl VimSession {
         initial_markdown: &str,
         rows: u16,
         cols: u16,
+        waker: Waker,
     ) -> io::Result<Self> {
         let rows = rows.max(2);
         let cols = cols.max(10);
@@ -226,6 +229,7 @@ impl VimSession {
         let parser = vt100::Parser::new_with_callbacks(nz_rows, nz_cols, 0, callbacks);
 
         let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+        let reader_waker = waker.clone();
         thread::Builder::new()
             .name("evertui-vim-pty-reader".to_owned())
             .spawn(move || {
@@ -238,10 +242,25 @@ impl VimSession {
                             if output_tx.send(buf[..n].to_vec()).is_err() {
                                 break;
                             }
+                            reader_waker.wake();
                         }
                     }
                 }
             })?;
+
+        // Vim exiting does not always close the PTY (a job started with `:!cmd &` keeps it open),
+        // so watch the process itself. `NOWAIT` leaves it for `has_exited` to reap.
+        if let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+            thread::Builder::new()
+                .name("evertui-vim-exit-watcher".to_owned())
+                .spawn(move || {
+                    while let Err(Errno::INTR) = waitid(
+                        WaitId::Pid(pid),
+                        WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+                    ) {}
+                    waker.wake();
+                })?;
+        }
 
         Ok(Self {
             note_guid,
@@ -715,6 +734,7 @@ mod tests {
             "Initial very long line in RAM only\nSecond line\n",
             24,
             80,
+            Waker::noop(),
         )
         .expect("should spawn vim in PTY backed by RAM memfd");
 

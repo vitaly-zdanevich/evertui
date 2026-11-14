@@ -7,6 +7,7 @@ use crate::evernote_api::normalize_source_url;
 use crate::preferences::Preferences;
 use crate::search::ParsedSearch;
 use crate::vim_pane::VimSession;
+use crate::wake::Waker;
 use crate::worker::{CATALOG_CONTEXT, WorkerCommand, WorkerEvent};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -17,6 +18,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
+/// Spinner and progress-bar frame time while something is loading or saving.
+pub const ANIMATION_FRAME: Duration = Duration::from_millis(50);
 const MIN_SAVE_ANIMATION_DURATION: Duration = Duration::from_millis(400);
 const SAVED_BADGE_DURATION: Duration = Duration::from_secs(2);
 const ERROR_BADGE_DURATION: Duration = Duration::from_secs(6);
@@ -382,6 +385,9 @@ pub struct App {
     pub geometry: LayoutGeometry,
 
     cmd_tx: Sender<WorkerCommand>,
+    /// Given to each Vim session so its output and exit wake the UI loop.
+    waker: Waker,
+    last_tick: Instant,
 }
 
 impl App {
@@ -442,6 +448,8 @@ impl App {
             geometry: LayoutGeometry::default(),
 
             cmd_tx,
+            waker: Waker::noop(),
+            last_tick: Instant::now(),
         };
         match initial_query {
             Some(query) => {
@@ -495,9 +503,31 @@ impl App {
         }
     }
 
+    pub fn set_waker(&mut self, waker: Waker) {
+        self.waker = waker;
+    }
+
+    /// When the UI loop must wake up even if no event arrives: the next animation frame,
+    /// or when a "Saved" / error badge expires. `None` means nothing is time-based right now.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<Instant> {
+        let animating = self.loading_list
+            || self.loading_note_guid.is_some()
+            || matches!(self.save_indicator, SaveIndicator::Saving { .. });
+        let frame = animating.then(|| self.last_tick + ANIMATION_FRAME);
+        let badge = match &self.save_indicator {
+            SaveIndicator::Saved { until, .. } | SaveIndicator::Failed { until, .. } => {
+                Some(*until)
+            }
+            _ => None,
+        };
+        frame.into_iter().chain(badge).min()
+    }
+
     pub fn tick(&mut self) {
         self.anim_tick = self.anim_tick.wrapping_add(1);
         let now = Instant::now();
+        self.last_tick = now;
 
         match &self.save_indicator {
             SaveIndicator::Saving {
@@ -1129,7 +1159,7 @@ impl App {
 
         let rows = self.geometry.vim_area.height.max(12);
         let cols = self.geometry.vim_area.width.max(40);
-        match VimSession::spawn(guid.clone(), &md, rows, cols) {
+        match VimSession::spawn(guid.clone(), &md, rows, cols, self.waker.clone()) {
             Ok(session) => {
                 self.vim_session = Some(session);
             }

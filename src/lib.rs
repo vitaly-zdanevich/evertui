@@ -7,4 +7,5 @@ pub mod preferences;
 pub mod search;
 pub mod ui;
 pub mod vim_pane;
+pub mod wake;
 pub mod worker;
