@@ -325,6 +325,32 @@ fn render_left_titles_panel(
     geom.left_titles_offset = state.offset();
 }
 
+/// Styled preview lines for the first `max_lines` lines of `markdown`, borrowing its text.
+///
+/// Each source line takes at least one screen row, so with `max_lines` = scroll + visible rows
+/// no visible line is left out, and a long note costs no more per redraw than a short one.
+fn preview_lines(markdown: &str, max_lines: usize) -> Vec<Line<'_>> {
+    markdown
+        .lines()
+        .take(max_lines)
+        .map(|line| {
+            let trimmed = line.trim();
+            let style = if trimmed.starts_with("[Image: ") || trimmed.starts_with("[Attachment: ") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if trimmed.starts_with('#') {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::from(vec![Span::styled(" ", style), Span::styled(line, style)])
+        })
+        .collect()
+}
+
 fn render_right_note_panel(
     frame: &mut Frame<'_>,
     app: &mut App,
@@ -369,32 +395,9 @@ fn render_right_note_panel(
                 Style::default().fg(Color::DarkGray),
             ))]
         } else {
-            preview_md
-                .lines()
-                .map(|line| {
-                    let trimmed = line.trim();
-                    if trimmed.starts_with("[Image: ") || trimmed.starts_with("[Attachment: ") {
-                        Line::from(Span::styled(
-                            format!(" {line}"),
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ))
-                    } else if trimmed.starts_with('#') {
-                        Line::from(Span::styled(
-                            format!(" {line}"),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::BOLD),
-                        ))
-                    } else {
-                        Line::from(Span::styled(
-                            format!(" {line}"),
-                            Style::default().fg(Color::White),
-                        ))
-                    }
-                })
-                .collect()
+            let visible =
+                usize::from(app.preview_scroll).saturating_add(usize::from(sections[1].height));
+            preview_lines(preview_md, visible)
         };
         frame.render_widget(
             Paragraph::new(lines)
@@ -1251,6 +1254,41 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         }));
         assert_eq!(app.selected_index, offset);
+    }
+
+    #[test]
+    fn preview_builds_only_reachable_lines_and_shows_the_same_screen() {
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::Widget;
+        // Long lines wrap to several rows, so rows and source lines differ.
+        let markdown: String = (0..5_000)
+            .map(|i| {
+                if i % 7 == 0 {
+                    format!("# Heading {i}\n")
+                } else {
+                    format!("line {i} {}\n", "word ".repeat(i % 40))
+                }
+            })
+            .collect();
+        let area = Rect::new(0, 0, 60, 20);
+        let draw = |lines: Vec<Line<'_>>, scroll: u16| {
+            let mut buf = Buffer::empty(area);
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .scroll((scroll, 0))
+                .render(area, &mut buf);
+            buf
+        };
+        for scroll in [0u16, 1, 37, 400, 2_000] {
+            let reachable = usize::from(scroll) + usize::from(area.height);
+            let lines = preview_lines(&markdown, reachable);
+            assert!(lines.len() <= reachable);
+            assert_eq!(
+                draw(lines, scroll),
+                draw(preview_lines(&markdown, usize::MAX), scroll),
+                "scroll {scroll}"
+            );
+        }
     }
 
     #[test]
