@@ -1143,17 +1143,7 @@ mod tests {
     fn renders_strictly_simple_ascii_and_ansi16_colors_for_tty() {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(tx);
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: vec![Notebook {
-                guid: NotebookGuid::from("nb1"),
-                name: "INBOX".to_owned(),
-                stack: None,
-                is_default: true,
-            }],
-            tags: vec![Tag {
-                guid: TagGuid::from("t1"),
-                name: "tui".to_owned(),
-            }],
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 1,
                 notes: vec![NoteSummary {
@@ -1166,6 +1156,18 @@ mod tests {
                     content_length: Some(128),
                 }],
             },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: vec![Notebook {
+                guid: NotebookGuid::from("nb1"),
+                name: "INBOX".to_owned(),
+                stack: None,
+                is_default: true,
+            }],
+            tags: vec![Tag {
+                guid: TagGuid::from("t1"),
+                name: "tui".to_owned(),
+            }],
         });
         app.save_indicator = SaveIndicator::Saving {
             label: "Saving note".to_owned(),
@@ -1189,9 +1191,7 @@ mod tests {
     fn left_panel_renders_titles_without_index_numbers() {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(tx);
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 2,
                 notes: vec![
@@ -1216,6 +1216,10 @@ mod tests {
                 ],
             },
         });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+        });
 
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal.draw(|f| render(f, &mut app)).unwrap();
@@ -1236,9 +1240,7 @@ mod tests {
     fn renders_borderless_layout_saving_space_and_photons() {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(tx);
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 1,
                 notes: vec![NoteSummary {
@@ -1251,6 +1253,10 @@ mod tests {
                     content_length: Some(64),
                 }],
             },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
         });
 
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
@@ -1317,9 +1323,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(tx);
         app.left_panel_visible = false;
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 1,
                 notes: vec![NoteSummary {
@@ -1332,6 +1336,10 @@ mod tests {
                     content_length: Some(8192),
                 }],
             },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
         });
         app.handle_worker_event(WorkerEvent::NoteLoaded {
             request_id: 1,

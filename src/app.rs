@@ -368,7 +368,6 @@ pub struct App {
     note_load_inflight: Option<NoteGuid>,
     pub next_request_id: u64,
     pub latest_search_req: u64,
-    pub latest_note_req: u64,
 
     pub save_indicator: SaveIndicator,
     pub anim_tick: usize,
@@ -429,7 +428,6 @@ impl App {
             note_load_inflight: None,
             next_request_id: 1,
             latest_search_req: 0,
-            latest_note_req: 0,
 
             save_indicator: SaveIndicator::Idle,
             anim_tick: 0,
@@ -641,18 +639,6 @@ impl App {
                 self.notebooks = notebooks;
                 self.install_tags(tags);
                 self.catalog_ready = true;
-            }
-            WorkerEvent::Bootstrapped {
-                notebooks,
-                tags,
-                page,
-            } => {
-                self.notebooks = notebooks;
-                self.install_tags(tags);
-                self.catalog_ready = true;
-                self.catalog_requested = true;
-                self.loading_list = false;
-                self.apply_search_page(page);
             }
             WorkerEvent::SearchCompleted { request_id, page } => {
                 if request_id == self.latest_search_req {
@@ -1045,7 +1031,6 @@ impl App {
                 continue;
             }
             let request_id = self.alloc_req_id();
-            self.latest_note_req = request_id;
             self.note_load_inflight = Some(guid.clone());
             if self.selected_summary().is_some_and(|s| s.guid == guid) {
                 self.loading_note_guid = Some(guid.clone());
@@ -2048,13 +2033,15 @@ mod tests {
             })
             .collect();
 
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 30,
                 notes: many_notes,
             },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
         });
 
         assert_eq!(app.notes.len(), MAX_LEFT_TITLES);
@@ -2150,13 +2137,15 @@ mod tests {
             })
             .collect();
 
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 5,
                 notes,
             },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
         });
         assert_eq!(app.selected_index, 0);
 
@@ -2215,16 +2204,19 @@ mod tests {
             })
             .collect();
 
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 3,
                 notes,
             },
         });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+        });
 
         assert_eq!(take_load(&rx), "g-1");
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::LoadCatalog)));
         assert!(rx.try_recv().is_err());
 
         app.set_selection(2);
@@ -2387,13 +2379,15 @@ mod tests {
     fn unsaved_vim_edits_block_leaving_the_note_until_saved() {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new(tx);
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 2,
                 notes: vec![summary("g-1", "One"), summary("g-2", "Two")],
             },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
         });
         app.handle_worker_event(WorkerEvent::NoteLoaded {
             request_id: 1,
@@ -2499,6 +2493,8 @@ mod tests {
                         note: detail(guid.as_str()),
                     });
                 }
+                // Sent once, behind the first list's `LoadNote`.
+                WorkerCommand::LoadCatalog => {}
                 other => panic!("unexpected worker command: {other:?}"),
             }
         }
@@ -2531,13 +2527,15 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut app = App::new(tx);
         assert!(matches!(rx.try_recv(), Ok(WorkerCommand::Bootstrap)));
-        app.handle_worker_event(WorkerEvent::Bootstrapped {
-            notebooks: Vec::new(),
-            tags: Vec::new(),
+        app.handle_worker_event(WorkerEvent::InitialNotes {
             page: SearchPage {
                 total_matching: 1,
                 notes: vec![summary("home", "Home")],
             },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
         });
         drain_loads(&mut app, &rx);
 

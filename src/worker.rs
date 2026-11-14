@@ -62,11 +62,6 @@ pub enum WorkerEvent {
         notebooks: Vec<Notebook>,
         tags: Vec<Tag>,
     },
-    Bootstrapped {
-        notebooks: Vec<Notebook>,
-        tags: Vec<Tag>,
-        page: SearchPage,
-    },
     SearchCompleted {
         request_id: u64,
         page: SearchPage,
