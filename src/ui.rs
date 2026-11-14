@@ -619,7 +619,7 @@ fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
             " j/k/1-9:Select  Enter:Edit in Vim  /:Search  Alt+Left/Right:History  t:Tags  n:Notebook  r:Rename  u:URL  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
         }
         (ModalState::None, FocusTarget::SearchInput) => {
-            " Enter:Run search | Syntax: tag:x  notebook:y  t:x  n:y  \"t x\"  \"n y\" | Ctrl+U:Clear | Esc:Back"
+            " Enter:Run search | Syntax: tag:x  notebook:y  t:x  n:y  \"t x\"  \"n y\" | Alt+Left/Right:Word | Ctrl+U:Clear | Esc:Back"
         }
         (ModalState::None, FocusTarget::RightVim) if app.vim_session.is_none() => {
             " j/k/PgUp/PgDn:Scroll  1-9:Note  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  u:URL  q:Quit"
@@ -1044,7 +1044,10 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
         )),
         Line::from("  * tag:work   t:work   t work   -t:archive   t:\"two words\""),
         Line::from("  * notebook:INBOX   n:INBOX   n INBOX   n \"Work Notes\""),
-        Line::from("  * Alt+Left / Alt+Right       Back / forward through searches, from memory"),
+        Line::from(
+            "  * Alt+Left / Alt+Right       Back / forward through searches (outside the field)",
+        ),
+        Line::from("  * While typing: Alt+Left / Alt+Right move by word"),
         Line::from(""),
         Line::from(Span::styled(
             "Left Panel (Titles, max 20):",

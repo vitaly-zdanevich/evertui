@@ -256,8 +256,11 @@ impl TextInput {
         self.cursor_chars = 0;
     }
 
+    /// Emacs / bash (readline) editing keys: `Ctrl+A`/`Ctrl+E` line start/end, `Ctrl+U` clear,
+    /// `Alt+Left`/`Alt+Right` back / forward one word.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('u') if ctrl => {
                 self.clear();
@@ -271,7 +274,15 @@ impl TextInput {
                 self.cursor_chars = self.text.chars().count();
                 true
             }
-            KeyCode::Char(ch) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            KeyCode::Left if alt => {
+                self.cursor_chars = self.word_start_before_cursor();
+                true
+            }
+            KeyCode::Right if alt => {
+                self.cursor_chars = self.word_end_after_cursor();
+                true
+            }
+            KeyCode::Char(ch) if !ctrl && !alt => {
                 let byte_idx = self.byte_index_at(self.cursor_chars);
                 self.text.insert(byte_idx, ch);
                 self.cursor_chars += 1;
@@ -317,6 +328,33 @@ impl TextInput {
             }
             _ => false,
         }
+    }
+
+    /// Like readline `backward-word`: start of the word at or before the cursor, where a
+    /// word is a run of letters and digits.
+    fn word_start_before_cursor(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut pos = self.cursor_chars.min(chars.len());
+        while pos > 0 && !chars[pos - 1].is_alphanumeric() {
+            pos -= 1;
+        }
+        while pos > 0 && chars[pos - 1].is_alphanumeric() {
+            pos -= 1;
+        }
+        pos
+    }
+
+    /// Like readline `forward-word`: end of the word at or after the cursor.
+    fn word_end_after_cursor(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut pos = self.cursor_chars.min(chars.len());
+        while pos < chars.len() && !chars[pos].is_alphanumeric() {
+            pos += 1;
+        }
+        while pos < chars.len() && chars[pos].is_alphanumeric() {
+            pos += 1;
+        }
+        pos
     }
 
     #[must_use]
@@ -1727,6 +1765,16 @@ impl App {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        // In the search field Alt+Left/Right move by word, as in bash, instead of
+        // walking search history.
+        if self.focus == FocusTarget::SearchInput
+            && alt
+            && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            self.search_input.handle_key(key);
+            return;
+        }
 
         // Global shortcuts available even while editing inside real Vim.
         match key.code {
@@ -3494,5 +3542,37 @@ mod tests {
                 .is_some_and(|err| err.contains("control"))
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn alt_arrows_move_by_word_in_the_search_field_like_bash() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.focus = FocusTarget::SearchInput;
+        app.search_input = TextInput::new("t:work  rust-lang");
+        let cursor = |app: &App| app.search_input.cursor_chars;
+        let alt_left = || key(KeyCode::Left, KeyModifiers::ALT);
+        let alt_right = || key(KeyCode::Right, KeyModifiers::ALT);
+
+        app.handle_terminal_event(alt_left());
+        assert_eq!(cursor(&app), 13, "back to the start of `lang`");
+        app.handle_terminal_event(alt_left());
+        assert_eq!(cursor(&app), 8, "back to the start of `rust`");
+        app.handle_terminal_event(alt_left());
+        app.handle_terminal_event(alt_left());
+        assert_eq!(cursor(&app), 0);
+        app.handle_terminal_event(alt_left());
+        assert_eq!(cursor(&app), 0, "stays at the start");
+
+        app.handle_terminal_event(alt_right());
+        assert_eq!(cursor(&app), 1, "end of `t`");
+        app.handle_terminal_event(alt_right());
+        assert_eq!(cursor(&app), 6, "end of `work`");
+        app.handle_terminal_event(alt_right());
+        app.handle_terminal_event(alt_right());
+        assert_eq!(cursor(&app), 17);
+
+        assert_eq!(app.search_input.text, "t:work  rust-lang");
+        assert_eq!(app.focus, FocusTarget::SearchInput);
     }
 }

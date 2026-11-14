@@ -21,6 +21,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
 - **Flexible search (`/`, `F3`, `Alt+s`)**:
   - `tag:something`, `notebook:something`
   - Aliases: `t:something`, `n:something`, `t something`, `n something`, `-t:something`, and quoted values (`t:"two words"`, `n "My Notebook"`).
+  - Bash-style editing: `Alt+Left` / `Alt+Right` move by word, `Ctrl+a` / `Ctrl+e` to start / end, `Ctrl+u` clears.
 - **Tag & Notebook management**:
   - `t` (`F4` / `Alt+t` / click `[Tags: ...]`) to toggle existing tags or create new tags on a note.
   - `n` (`F5` / `Alt+n` / click `[Notebook: ...]`) to move a note to another notebook.
