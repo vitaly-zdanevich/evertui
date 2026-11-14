@@ -6,6 +6,7 @@ use crate::search::CompiledEvernoteFilter;
 use crate::wake::Waker;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 pub const CATALOG_CONTEXT: &str = "Notebooks and tags";
 
@@ -53,6 +54,17 @@ pub enum WorkerCommand {
     Shutdown,
 }
 
+/// What a failed save says about trying again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveRetry {
+    /// Evernote refused the content; sending it again unchanged fails the same way.
+    No,
+    /// Network or timeout: try again with growing delays.
+    Backoff,
+    /// Rate limited: Evernote asked to wait this long.
+    After(Duration),
+}
+
 #[derive(Debug)]
 pub enum WorkerEvent {
     /// Titles are ready. Notebooks and tags may still be in flight.
@@ -80,6 +92,14 @@ pub enum WorkerEvent {
         guid: NoteGuid,
         enml: String,
         updated: Option<TimestampMs>,
+    },
+    /// `enml` is the content that failed, so a failure of an older save can be told apart
+    /// from the latest one.
+    SaveFailed {
+        guid: NoteGuid,
+        enml: String,
+        message: String,
+        retry: SaveRetry,
     },
     TagsSaved {
         guid: NoteGuid,
@@ -214,10 +234,16 @@ impl BackendHandle {
                                     });
                                 }
                                 Err(e) => {
-                                    evt_tx.send(WorkerEvent::Error {
-                                        context: "Save note".to_owned(),
+                                    let retry = match e.rate_limit_wait() {
+                                        Some(wait) => SaveRetry::After(wait),
+                                        None if e.is_retryable() => SaveRetry::Backoff,
+                                        None => SaveRetry::No,
+                                    };
+                                    evt_tx.send(WorkerEvent::SaveFailed {
+                                        guid,
+                                        enml,
                                         message: e.to_string(),
-                                        was_save: true,
+                                        retry,
                                     });
                                 }
                             }

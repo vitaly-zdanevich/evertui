@@ -217,6 +217,15 @@ fn build_status_spans(app: &App) -> Vec<Span<'static>> {
                     format!(" [!] {} ", truncate_ascii_dots(err, 38)),
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 )]
+            } else if app.unsynced_count() > 0 {
+                let n = app.unsynced_count();
+                vec![Span::styled(
+                    format!(
+                        " [!] {n} note{} not saved to Evernote yet ",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )]
             } else if app.loading_list {
                 let sp = SPINNER_FRAMES[app.anim_tick % SPINNER_FRAMES.len()];
                 vec![Span::styled(

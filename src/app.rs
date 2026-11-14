@@ -8,7 +8,7 @@ use crate::preferences::Preferences;
 use crate::search::ParsedSearch;
 use crate::vim_pane::VimSession;
 use crate::wake::Waker;
-use crate::worker::{CATALOG_CONTEXT, WorkerCommand, WorkerEvent};
+use crate::worker::{CATALOG_CONTEXT, SaveRetry, WorkerCommand, WorkerEvent};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -23,6 +23,14 @@ pub const ANIMATION_FRAME: Duration = Duration::from_millis(50);
 const MIN_SAVE_ANIMATION_DURATION: Duration = Duration::from_millis(400);
 const SAVED_BADGE_DURATION: Duration = Duration::from_secs(2);
 const ERROR_BADGE_DURATION: Duration = Duration::from_secs(6);
+/// Waits between automatic retries of a failed save; the last one repeats.
+const SAVE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 /// Fits the status bar's 38 columns.
 pub const UNSAVED_VIM_MESSAGE: &str = "Unsaved in Vim: :w save, :q! discard";
 
@@ -339,6 +347,18 @@ struct SearchScreen {
     preview_scroll: u16,
 }
 
+/// Note content saved in Vim that Evernote has not confirmed yet.
+#[derive(Debug, Clone)]
+struct UnsyncedNote {
+    title: String,
+    /// The latest content; older saves of the same note no longer matter.
+    enml: String,
+    failed_attempts: usize,
+    /// When to send it again. `None` while a save is on its way, or after an error that
+    /// retrying cannot fix (then the next `:w` sends it again).
+    retry_at: Option<Instant>,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub focus: FocusTarget,
@@ -378,6 +398,7 @@ pub struct App {
     pub save_indicator: SaveIndicator,
     pub anim_tick: usize,
     pub status_error: Option<String>,
+    unsynced: HashMap<NoteGuid, UnsyncedNote>,
 
     pub preferences: Preferences,
     pub preferences_path: Option<PathBuf>,
@@ -441,6 +462,7 @@ impl App {
             save_indicator: SaveIndicator::Idle,
             anim_tick: 0,
             status_error: None,
+            unsynced: HashMap::new(),
 
             preferences,
             preferences_path,
@@ -524,13 +546,19 @@ impl App {
             }
             _ => None,
         };
-        frame.into_iter().chain(badge).min()
+        let retry = self
+            .unsynced
+            .values()
+            .filter_map(|note| note.retry_at)
+            .min();
+        frame.into_iter().chain(badge).chain(retry).min()
     }
 
     pub fn tick(&mut self) {
         self.anim_tick = self.anim_tick.wrapping_add(1);
         let now = Instant::now();
         self.last_tick = now;
+        self.retry_due_saves(now);
 
         match &self.save_indicator {
             SaveIndicator::Saving {
@@ -613,7 +641,7 @@ impl App {
                 .markdown
                 .strip_suffix('\n')
                 .unwrap_or(&prepared.markdown);
-        if unchanged {
+        if unchanged && !self.unsynced.contains_key(guid) {
             self.save_indicator = SaveIndicator::Saved {
                 label: "No changes".to_owned(),
                 until: Instant::now() + SAVED_BADGE_DURATION,
@@ -629,12 +657,46 @@ impl App {
             cached.enml.clone_from(&new_enml);
         }
 
+        self.unsynced.insert(
+            guid.clone(),
+            UnsyncedNote {
+                title: detail.title.clone(),
+                enml: new_enml.clone(),
+                failed_attempts: 0,
+                retry_at: None,
+            },
+        );
         self.begin_saving("Saving note");
         let _ = self.cmd_tx.send(WorkerCommand::SaveContent {
             guid: guid.clone(),
             title: detail.title,
             enml: new_enml,
         });
+    }
+
+    /// Sends again every failed save whose wait is over.
+    fn retry_due_saves(&mut self, now: Instant) {
+        let due: Vec<(NoteGuid, String, String)> = self
+            .unsynced
+            .iter_mut()
+            .filter(|(_, note)| note.retry_at.is_some_and(|at| at <= now))
+            .map(|(guid, note)| {
+                note.retry_at = None;
+                (guid.clone(), note.title.clone(), note.enml.clone())
+            })
+            .collect();
+        for (guid, title, enml) in due {
+            self.begin_saving("Retrying save");
+            let _ = self
+                .cmd_tx
+                .send(WorkerCommand::SaveContent { guid, title, enml });
+        }
+    }
+
+    /// Number of notes whose last `:w` has not reached Evernote yet.
+    #[must_use]
+    pub fn unsynced_count(&self) -> usize {
+        self.unsynced.len()
     }
 
     fn begin_saving(&mut self, label: impl Into<String>) {
@@ -734,6 +796,7 @@ impl App {
                 enml,
                 updated,
             } => {
+                let saved_enml = enml.clone();
                 if let Some(detail) = self.note_cache.get_mut(&guid) {
                     detail.enml = enml;
                     if updated.is_some() {
@@ -748,6 +811,48 @@ impl App {
                 self.sync_history_note(&guid);
                 self.remember_current_screen();
                 self.finish_saving("Saved");
+                // A newer `:w` of the same note may still be on its way.
+                if self
+                    .unsynced
+                    .get(&guid)
+                    .is_some_and(|note| note.enml == saved_enml)
+                {
+                    self.unsynced.remove(&guid);
+                }
+            }
+            WorkerEvent::SaveFailed {
+                guid,
+                enml,
+                message,
+                retry,
+            } => {
+                let now = Instant::now();
+                let Some(note) = self
+                    .unsynced
+                    .get_mut(&guid)
+                    .filter(|note| note.enml == enml)
+                else {
+                    // An older version failed; the newer one is already queued.
+                    return;
+                };
+                note.failed_attempts += 1;
+                let wait = match retry {
+                    SaveRetry::No => None,
+                    SaveRetry::Backoff => Some(
+                        SAVE_RETRY_DELAYS
+                            [(note.failed_attempts - 1).min(SAVE_RETRY_DELAYS.len() - 1)],
+                    ),
+                    SaveRetry::After(wait) => Some(wait),
+                };
+                note.retry_at = wait.map(|wait| now + wait);
+                let message = match wait {
+                    Some(wait) => format!("Not saved, retry in {}s: {message}", wait.as_secs()),
+                    None => format!("Not saved (:w retries): {message}"),
+                };
+                self.save_indicator = SaveIndicator::Failed {
+                    message,
+                    until: now + ERROR_BADGE_DURATION,
+                };
             }
             WorkerEvent::TagsSaved {
                 guid,
@@ -2512,6 +2617,28 @@ mod tests {
         (app, rx, guid, md)
     }
 
+    fn take_save(rx: &mpsc::Receiver<WorkerCommand>) -> String {
+        match rx.try_recv() {
+            Ok(WorkerCommand::SaveContent { enml, .. }) => enml,
+            other => panic!("expected SaveContent, got {other:?}"),
+        }
+    }
+
+    fn fail_save(app: &mut App, guid: &NoteGuid, enml: &str, retry: SaveRetry) {
+        app.handle_worker_event(WorkerEvent::SaveFailed {
+            guid: guid.clone(),
+            enml: enml.to_owned(),
+            message: "boom".to_owned(),
+            retry,
+        });
+    }
+
+    /// Pretends the retry wait is over, then lets the timer fire.
+    fn fire_retry(app: &mut App, guid: &NoteGuid) {
+        app.unsynced.get_mut(guid).unwrap().retry_at = Some(Instant::now());
+        app.tick();
+    }
+
     #[test]
     fn write_without_edits_is_not_uploaded() {
         let (mut app, rx, guid, md) = app_with_loaded_note();
@@ -2525,6 +2652,87 @@ mod tests {
             &app.save_indicator,
             SaveIndicator::Saved { label, .. } if label == "No changes"
         ));
+        assert_eq!(app.unsynced_count(), 0);
+    }
+
+    #[test]
+    fn failed_save_retries_with_growing_delays_until_saved() {
+        let (mut app, rx, guid, md) = app_with_loaded_note();
+        app.save_markdown_from_vim(&guid, &format!("{md}\nmore\n"));
+        let enml = take_save(&rx);
+        assert_eq!(app.unsynced_count(), 1);
+
+        let before = Instant::now();
+        fail_save(&mut app, &guid, &enml, SaveRetry::Backoff);
+        let retry_at = app.unsynced[&guid].retry_at.expect("a retry is scheduled");
+        assert!(retry_at >= before + Duration::from_secs(2));
+        assert!(app.next_deadline().is_some_and(|d| d <= retry_at));
+        assert!(matches!(
+            &app.save_indicator,
+            SaveIndicator::Failed { message, .. } if message.starts_with("Not saved, retry in 2s")
+        ));
+
+        fire_retry(&mut app, &guid);
+        assert_eq!(take_save(&rx), enml, "the same content is sent again");
+
+        fail_save(&mut app, &guid, &enml, SaveRetry::Backoff);
+        assert!(app.unsynced[&guid].retry_at.unwrap() >= Instant::now() + Duration::from_secs(4));
+        fire_retry(&mut app, &guid);
+        assert_eq!(take_save(&rx), enml);
+
+        app.handle_worker_event(WorkerEvent::ContentSaved {
+            guid: guid.clone(),
+            enml,
+            updated: None,
+        });
+        assert_eq!(app.unsynced_count(), 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn rate_limit_waits_as_told_and_refused_saves_wait_for_the_next_write() {
+        let (mut app, rx, guid, md) = app_with_loaded_note();
+        let edited = format!("{md}\nmore\n");
+        app.save_markdown_from_vim(&guid, &edited);
+        let enml = take_save(&rx);
+
+        fail_save(
+            &mut app,
+            &guid,
+            &enml,
+            SaveRetry::After(Duration::from_secs(90)),
+        );
+        assert!(app.unsynced[&guid].retry_at.unwrap() >= Instant::now() + Duration::from_secs(89));
+
+        // Evernote refused it: no automatic retry, but the next `:w` sends it again
+        // even though the text did not change since.
+        fail_save(&mut app, &guid, &enml, SaveRetry::No);
+        assert_eq!(app.unsynced[&guid].retry_at, None);
+        app.tick();
+        assert!(rx.try_recv().is_err());
+        app.save_markdown_from_vim(&guid, &edited);
+        take_save(&rx);
+    }
+
+    #[test]
+    fn failure_of_an_older_save_does_not_touch_the_newer_one() {
+        let (mut app, rx, guid, md) = app_with_loaded_note();
+        app.save_markdown_from_vim(&guid, &format!("{md}\nfirst\n"));
+        let first = take_save(&rx);
+        app.save_markdown_from_vim(&guid, &format!("{md}\nsecond\n"));
+        let second = take_save(&rx);
+
+        fail_save(&mut app, &guid, &first, SaveRetry::Backoff);
+        assert_eq!(
+            app.unsynced[&guid].retry_at, None,
+            "the newer save is in flight"
+        );
+        app.handle_worker_event(WorkerEvent::ContentSaved {
+            guid: guid.clone(),
+            enml: second,
+            updated: None,
+        });
+        assert_eq!(app.unsynced_count(), 0);
     }
 
     fn take_load(rx: &mpsc::Receiver<WorkerCommand>) -> String {
