@@ -34,6 +34,9 @@ const SAVE_RETRY_DELAYS: [Duration; 5] = [
 /// Shown after the first `q` while saves are still on their way to Evernote.
 pub const QUIT_AFTER_SYNC_MESSAGE: &str = "Saving first; q again: quit, lose it";
 
+/// Shown while a reply that would close the note open in Vim waits.
+pub const DEFERRED_REPLY_MESSAGE: &str = "Results ready: leave Vim to see them";
+
 /// Fits the status bar's 38 columns.
 pub const UNSAVED_VIM_MESSAGE: &str = "Unsaved in Vim: :w save, :q! discard";
 
@@ -404,6 +407,9 @@ pub struct App {
     unsynced: HashMap<NoteGuid, UnsyncedNote>,
     /// `q` was pressed while saves were pending: quit as soon as they land.
     quit_after_sync: bool,
+    /// Replies that would change the selected note, and so close Vim, held back while
+    /// Vim is in use. Applied in order once it is safe (`replay_deferred_replies`).
+    deferred_replies: Vec<WorkerEvent>,
 
     pub preferences: Preferences,
     pub preferences_path: Option<PathBuf>,
@@ -469,6 +475,7 @@ impl App {
             status_error: None,
             unsynced: HashMap::new(),
             quit_after_sync: false,
+            deferred_replies: Vec::new(),
 
             preferences,
             preferences_path,
@@ -630,6 +637,8 @@ impl App {
                 self.ensure_vim_for_note(&guid);
             }
         }
+
+        self.replay_deferred_replies();
     }
 
     fn save_markdown_from_vim(&mut self, guid: &NoteGuid, edited_md: &str) {
@@ -741,7 +750,65 @@ impl App {
         }
     }
 
+    /// Vim is being worked in: it has focus, or edits not saved with `:w`.
+    fn vim_in_use(&self) -> bool {
+        self.vim_session
+            .as_ref()
+            .is_some_and(|vim| self.focus == FocusTarget::RightVim || vim.has_unsaved_changes())
+    }
+
+    /// Replies that select another note, which would close Vim and drop its edits.
+    fn reply_replaces_selection(&self, evt: &WorkerEvent) -> bool {
+        match evt {
+            WorkerEvent::InitialNotes { .. } | WorkerEvent::NoteCreated { .. } => true,
+            WorkerEvent::SearchCompleted { request_id, .. } => {
+                *request_id == self.latest_search_req
+            }
+            _ => false,
+        }
+    }
+
+    /// Applies held-back replies once Vim is closed, or left with everything saved.
+    fn replay_deferred_replies(&mut self) {
+        if self.deferred_replies.is_empty() {
+            return;
+        }
+        if self.vim_in_use() {
+            let unsaved = self
+                .vim_session
+                .as_ref()
+                .is_some_and(VimSession::has_unsaved_changes);
+            if !unsaved && self.status_error.is_none() {
+                self.status_error = Some(DEFERRED_REPLY_MESSAGE.to_owned());
+            }
+            return;
+        }
+        if self.status_error.as_deref() == Some(DEFERRED_REPLY_MESSAGE) {
+            self.status_error = None;
+        }
+        for evt in std::mem::take(&mut self.deferred_replies) {
+            self.handle_worker_event(evt);
+        }
+    }
+
     pub fn handle_worker_event(&mut self, evt: WorkerEvent) {
+        if self.vim_in_use() && self.reply_replaces_selection(&evt) {
+            self.loading_list = false;
+            self.status_error = Some(
+                if self
+                    .vim_session
+                    .as_ref()
+                    .is_some_and(VimSession::has_unsaved_changes)
+                {
+                    UNSAVED_VIM_MESSAGE
+                } else {
+                    DEFERRED_REPLY_MESSAGE
+                }
+                .to_owned(),
+            );
+            self.deferred_replies.push(evt);
+            return;
+        }
         match evt {
             WorkerEvent::InitialNotes { page } => {
                 self.loading_list = false;
@@ -2612,6 +2679,64 @@ mod tests {
         app.handle_terminal_event(key(KeyCode::Char('\\'), KeyModifiers::CONTROL));
         app.handle_terminal_event(key(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(app.selected_index, 1);
+    }
+
+    #[test]
+    fn replies_that_would_close_vim_wait_until_vim_is_left() {
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 2,
+                notes: vec![summary("g-1", "One"), summary("g-2", "Two")],
+            },
+        });
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note: detail("g-1"),
+        });
+
+        // A search goes out, then the user starts editing before it answers.
+        app.search_input = TextInput::new("later");
+        app.execute_search();
+        let request_id = app.latest_search_req;
+        app.open_selected_in_vim();
+        app.vim_session
+            .as_ref()
+            .unwrap()
+            .write_raw(b"GoTyped while searching\x1b");
+        wait_for(&mut app, "the unsaved flag", |app| {
+            app.vim_session
+                .as_ref()
+                .is_some_and(VimSession::has_unsaved_changes)
+        });
+
+        app.handle_worker_event(WorkerEvent::SearchCompleted {
+            request_id,
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("g-9", "Found")],
+            },
+        });
+        assert!(app.vim_session.is_some(), "Vim with edits must stay open");
+        assert_eq!(app.notes[0].guid.as_str(), "g-1", "list waits");
+        assert_eq!(app.status_error.as_deref(), Some(UNSAVED_VIM_MESSAGE));
+        assert!(!app.loading_list);
+
+        // Saved but still editing: the results keep waiting.
+        app.vim_session.as_ref().unwrap().write_raw(b":w\r");
+        wait_for(&mut app, "the save", |app| {
+            app.status_error.as_deref() == Some(DEFERRED_REPLY_MESSAGE)
+        });
+        assert_eq!(app.notes[0].guid.as_str(), "g-1");
+        while rx.try_recv().is_ok() {}
+
+        // Leaving Vim shows the results.
+        app.handle_terminal_event(key(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+        app.poll_vim_activity();
+        assert_eq!(app.notes[0].guid.as_str(), "g-9");
+        assert_eq!(app.active_query, "later");
+        assert_eq!(app.status_error, None);
     }
 
     fn app_with_loaded_note() -> (App, mpsc::Receiver<WorkerCommand>, NoteGuid, String) {
