@@ -1,6 +1,6 @@
 use crate::app::{
     App, FocusTarget, LayoutGeometry, ModalState, NotebookPickerModal, PreferencesModal,
-    PromptKind, SaveIndicator, TagEditorModal, TagModalRow, TextPromptModal,
+    PromptKind, RawEnmlModal, SaveIndicator, TagEditorModal, TagModalRow, TextPromptModal,
 };
 use crate::domain::{LeftPanelWidthCols, MAX_LEFT_TITLES};
 use crate::search::ParsedSearch;
@@ -427,6 +427,7 @@ fn render_note_metadata_header(
     area: Rect,
     geom: &mut LayoutGeometry,
 ) {
+    geom.enml_hit = Rect::default();
     let Some(summary) = app.selected_summary() else {
         frame.render_widget(
             Paragraph::new(" No note selected").style(Style::default().fg(Color::DarkGray)),
@@ -541,13 +542,31 @@ fn render_note_metadata_header(
         format!("  |  {}", meta_extra.join(" | "))
     };
 
-    let line_dates = Line::from(vec![
+    let mut line_dates = Line::from(vec![
         Span::styled(" Created: ", Style::default().fg(Color::DarkGray)),
         Span::styled(created, Style::default().fg(Color::Gray)),
         Span::styled("  |  Updated: ", Style::default().fg(Color::DarkGray)),
         Span::styled(updated, Style::default().fg(Color::Gray)),
         Span::styled(extra_str, Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
     ]);
+    // Clickable only when it fits on the row.
+    let enml_x = u16::try_from(line_dates.width()).unwrap_or(u16::MAX);
+    let enml_w = u16::try_from(ENML_BUTTON.width()).unwrap_or(u16::MAX);
+    if area.height > 2 && enml_x.saturating_add(enml_w) <= area.width {
+        line_dates.push_span(Span::styled(
+            ENML_BUTTON,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+        geom.enml_hit = Rect {
+            x: area.x + enml_x,
+            y: area.y + 2,
+            width: enml_w,
+            height: 1,
+        };
+    }
 
     let meta_height = 3.min(area.height);
     frame.render_widget(
@@ -576,6 +595,8 @@ fn render_note_metadata_header(
         }
     }
 }
+
+const ENML_BUTTON: &str = "[ENML (x)]";
 
 fn note_header_height(app: &App, max_rows: u16) -> u16 {
     let rows = if app.selected_detail().is_some() {
@@ -615,17 +636,18 @@ fn render_footer_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
             " Space/Enter:Toggle checkbox | Up/Down:Select | Esc/p/q:Close preferences"
         }
         (ModalState::Help, _) => " Esc / Enter / q:Close help",
+        (ModalState::RawEnml(_), _) => " j/k/PgUp/PgDn/g/G:Scroll | Esc/q/x:Close",
         (ModalState::None, FocusTarget::LeftTitles) => {
-            " j/k/1-9:Select  Enter:Edit in Vim  /:Search  Alt+Left/Right:History  t:Tags  n:Notebook  r:Rename  u:URL  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
+            " j/k/1-9:Select  Enter:Edit in Vim  /:Search  Alt+Left/Right:History  t:Tags  n:Notebook  r:Rename  u:URL  x:ENML  c:New  p:Prefs  b:Hide  ?:Help  q:Quit"
         }
         (ModalState::None, FocusTarget::SearchInput) => {
             " Enter:Run search | Syntax: tag:x  notebook:y  t:x  n:y  \"t x\"  \"n y\" | Alt+Left/Right:Word | Ctrl+W:Del word | Ctrl+U:Clear | Esc:Back"
         }
         (ModalState::None, FocusTarget::RightVim) if app.vim_session.is_none() => {
-            " j/k/PgUp/PgDn:Scroll  1-9:Note  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  u:URL  q:Quit"
+            " j/k/PgUp/PgDn:Scroll  1-9:Note  Enter:Edit in Vim  p:Prefs  Esc/Tab/h:Titles  t:Tags  n:Notebook  u:URL  x:ENML  q:Quit"
         }
         (ModalState::None, FocusTarget::RightVim) => {
-            " :w:Save to Evernote | :q:Close Vim | Ctrl+\\ / Alt+h:Titles | F2:Toggle Left | F4:Tags | F5:Notebook | F7:Prefs | F8:URL"
+            " :w:Save to Evernote | :q:Close Vim | Ctrl+\\ / Alt+h:Titles | F2:Toggle Left | F4:Tags | F5:Notebook | F7:Prefs | F8:URL | F9:ENML"
         }
     };
 
@@ -647,6 +669,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &App, area: Rect, geom: &mut LayoutG
         ModalState::NotebookPicker(nm) => render_notebook_modal(frame, app, nm, area, geom),
         ModalState::TextPrompt(pm) => render_prompt_modal(frame, pm, area, geom),
         ModalState::Preferences(pm) => render_preferences_modal(frame, app, pm, area, geom),
+        ModalState::RawEnml(m) => render_raw_enml_modal(frame, m, area, geom),
         ModalState::Help => render_help_modal(frame, area, geom),
     }
 }
@@ -1021,6 +1044,76 @@ fn render_preferences_modal(
     frame.render_widget(Paragraph::new(desc), chunks[2]);
 }
 
+fn render_raw_enml_modal(
+    frame: &mut Frame<'_>,
+    modal: &RawEnmlModal,
+    area: Rect,
+    geom: &mut LayoutGeometry,
+) {
+    let popup = centered_rect(
+        area,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    );
+    let width = usize::from(popup.width.saturating_sub(2)).max(1);
+    let height = usize::from(popup.height.saturating_sub(2));
+    let rows = hard_wrap(&modal.enml, width);
+    let max_scroll = rows.len().saturating_sub(height);
+    let scroll = modal.scroll.min(max_scroll);
+    let last_shown = (scroll + height).min(rows.len());
+    let title = format!(
+        "Raw ENML - {} - {} bytes, rows {}-{last_shown} of {}",
+        truncate_ascii_dots(&modal.note_title, 30),
+        modal.enml.len(),
+        (scroll + 1).min(last_shown),
+        rows.len(),
+    );
+    let inner = render_modal_surface(
+        frame,
+        popup,
+        Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        geom,
+    );
+    geom.raw_enml_max_scroll = max_scroll;
+
+    let lines: Vec<Line<'_>> = rows[scroll..last_shown]
+        .iter()
+        .map(|row| Line::from(row.as_str()))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(Color::Gray).bg(Color::Black)),
+        inner,
+    );
+}
+
+/// Splits text into rows of at most `width` columns. Breaks anywhere, since markup like
+/// ENML often has no spaces where a row should end; line breaks in the text are kept.
+/// Tabs and other control characters show as one space, so every column stays aligned.
+fn hard_wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let mut row = String::new();
+        let mut row_width = 0;
+        for ch in line.chars() {
+            let ch = if ch.is_control() { ' ' } else { ch };
+            let ch_width = ch.width().unwrap_or(0);
+            if row_width + ch_width > width && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            row.push(ch);
+            row_width += ch_width;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometry) {
     let popup = centered_rect(area, 78, 24);
     let inner = render_modal_surface(
@@ -1064,6 +1157,7 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
         Line::from("  * n (or F5 / Alt+n)          Change note's notebook"),
         Line::from("  * r (or F6 / Alt+r)          Rename note title"),
         Line::from("  * u (or F8 / Alt+u / click)  Set source URL (empty clears)"),
+        Line::from("  * x (or F9 / Alt+x / click)  Show the note's raw ENML"),
         Line::from("  * c                          Create new note"),
         Line::from("  * b (or F2 / Alt+b)          Hide / show left panel"),
         Line::from(""),
@@ -1153,7 +1247,9 @@ mod tests {
         NoteDetail, NoteGuid, NoteSummary, Notebook, NotebookGuid, SearchPage, Tag, TagGuid,
     };
     use crate::worker::WorkerEvent;
-    use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::sync::mpsc;
@@ -1538,5 +1634,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn raw_enml_rows_break_anywhere_and_keep_line_breaks() {
+        assert_eq!(
+            hard_wrap("<en-note><div>ab</div></en-note>", 10),
+            ["<en-note><", "div>ab</di", "v></en-not", "e>"]
+        );
+        assert_eq!(hard_wrap("a\tb\n\nc", 10), ["a b", "", "c"]);
+        assert_eq!(
+            hard_wrap("日本語", 4),
+            ["日本", "語"],
+            "wide characters never split"
+        );
+    }
+
+    #[test]
+    fn enml_button_opens_a_scrollable_raw_view_of_the_note() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![NoteSummary {
+                    guid: "g1".into(),
+                    title: "Raw".to_owned(),
+                    created: None,
+                    updated: None,
+                    notebook_guid: None,
+                    tag_guids: Vec::new(),
+                    content_length: None,
+                }],
+            },
+        });
+        let enml: String = (0..40).map(|i| format!("<div>line {i}</div>\n")).collect();
+        let enml = format!("<en-note>\n{enml}</en-note>");
+        app.note_cache.insert(
+            NoteGuid::from("g1"),
+            NoteDetail {
+                guid: NoteGuid::from("g1"),
+                title: "Raw".to_owned(),
+                enml: enml.clone(),
+                created: None,
+                updated: None,
+                notebook_guid: None,
+                tag_guids: Vec::new(),
+                tag_names: Vec::new(),
+                source_url: None,
+                content_length: None,
+                resources: Vec::new(),
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let hit = app.geometry.enml_hit;
+        assert_eq!(hit.width, u16::try_from(ENML_BUTTON.len()).unwrap());
+        let button: String = (hit.x..hit.x + hit.width)
+            .map(|x| terminal.backend().buffer()[(x, hit.y)].symbol().to_owned())
+            .collect();
+        assert_eq!(button, ENML_BUTTON);
+
+        app.handle_terminal_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::empty(),
+        }));
+        let ModalState::RawEnml(m) = &app.modal else {
+            panic!("click should open the raw ENML view, got {:?}", app.modal);
+        };
+        assert_eq!(m.enml, enml);
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        assert_pure_ascii_and_ansi16(terminal.backend().buffer());
+        let inner = app.geometry.modal_inner.unwrap();
+        let first_row = |terminal: &Terminal<TestBackend>| -> String {
+            (inner.x..inner.x + inner.width)
+                .map(|x| {
+                    terminal.backend().buffer()[(x, inner.y)]
+                        .symbol()
+                        .to_owned()
+                })
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+        assert_eq!(first_row(&terminal), "<en-note>");
+
+        let key = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle_terminal_event(key(KeyCode::Char('j')));
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        assert_eq!(first_row(&terminal), "<div>line 0</div>");
+
+        app.handle_terminal_event(key(KeyCode::Char('G')));
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let ModalState::RawEnml(m) = &app.modal else {
+            panic!("G must keep the view open");
+        };
+        assert_eq!(
+            m.scroll,
+            42 - usize::from(inner.height),
+            "last row at the bottom"
+        );
+
+        app.handle_terminal_event(key(KeyCode::Char('k')));
+        let ModalState::RawEnml(m2) = &app.modal else {
+            panic!("k must keep the view open");
+        };
+        assert_eq!(
+            m2.scroll,
+            41 - usize::from(inner.height),
+            "k moves at once after G"
+        );
+
+        app.handle_terminal_event(key(KeyCode::Esc));
+        assert!(matches!(app.modal, ModalState::None));
+        app.handle_terminal_event(key(KeyCode::Char('x')));
+        assert!(
+            matches!(app.modal, ModalState::RawEnml(_)),
+            "x opens it too"
+        );
     }
 }

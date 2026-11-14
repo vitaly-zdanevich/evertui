@@ -26,6 +26,7 @@ Uses pure ASCII chrome and 16-color ANSI styles so it works cleanly in Linux vir
   - `t` (`F4` / `Alt+t` / click `[Tags: ...]`) to toggle existing tags or create new tags on a note.
   - `n` (`F5` / `Alt+n` / click `[Notebook: ...]`) to move a note to another notebook.
   - `u` (`F8` / `Alt+u` / click the URL) to set the note source URL. It stays on one line and is not cut short with `...`. An empty prompt clears it.
+  - `x` (`F9` / `Alt+x` / click `[ENML (x)]`) to see the note's raw ENML, the XHTML Evernote stores, as received or as last saved with `:w`.
 - **Resizable & collapsible panels**:
   - Drag the seam between panels with the mouse to resize panels (resizing `vim`'s PTY live).
   - Press `b` / `F2` / `Alt+b` (or click `<< Hide` / `>> Titles`) to hide or show the left panel.

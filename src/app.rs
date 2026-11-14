@@ -39,6 +39,7 @@ pub const DEFERRED_REPLY_MESSAGE: &str = "Results ready: leave Vim to see them";
 
 /// The tag editor replaces a note's whole tag set, so it must not open with names missing.
 pub const TAGS_NOT_LOADED_MESSAGE: &str = "Tag names not loaded yet: try again";
+pub const NOTE_NOT_LOADED_MESSAGE: &str = "Note still loading: try again";
 
 /// A spare Vim that dies this many times is not restarted again (Vim missing or broken).
 const SPARE_VIM_MAX_FAILURES: u8 = 3;
@@ -211,6 +212,15 @@ pub enum PromptKind {
     SetSourceUrl,
 }
 
+/// Read-only view of the note's ENML as stored in Evernote, or as last saved with `:w`.
+#[derive(Clone, Debug)]
+pub struct RawEnmlModal {
+    pub note_title: String,
+    pub enml: String,
+    /// First screen row shown, after wrapping to the popup width.
+    pub scroll: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct TextPromptModal {
     pub kind: PromptKind,
@@ -233,6 +243,7 @@ pub enum ModalState {
     NotebookPicker(NotebookPickerModal),
     TextPrompt(TextPromptModal),
     Preferences(PreferencesModal),
+    RawEnml(RawEnmlModal),
     Help,
 }
 
@@ -405,9 +416,12 @@ pub struct LayoutGeometry {
     pub notebook_hit: Rect,
     pub tags_hit: Rect,
     pub url_hit: Rect,
+    pub enml_hit: Rect,
     pub vim_area: Rect,
     pub modal_area: Option<Rect>,
     pub modal_inner: Option<Rect>,
+    /// Largest useful `RawEnmlModal::scroll` for the popup as last drawn.
+    pub raw_enml_max_scroll: usize,
 }
 
 /// One search result screen, kept so back and forward do not hit the network.
@@ -1598,6 +1612,23 @@ impl App {
         }
     }
 
+    /// Shows the selected note's ENML, the XHTML Evernote stores, exactly as received or
+    /// as last saved with `:w`.
+    pub fn open_raw_enml_modal(&mut self) {
+        if self.selected_summary().is_none() {
+            return;
+        }
+        let Some(detail) = self.selected_detail() else {
+            self.status_error = Some(NOTE_NOT_LOADED_MESSAGE.to_owned());
+            return;
+        };
+        self.modal = ModalState::RawEnml(RawEnmlModal {
+            note_title: detail.title.clone(),
+            enml: detail.enml.clone(),
+            scroll: 0,
+        });
+    }
+
     pub fn open_tag_modal(&mut self) {
         let Some(detail) = self.selected_detail().cloned() else {
             return;
@@ -1861,6 +1892,14 @@ impl App {
                 self.open_preferences_modal();
                 return;
             }
+            KeyCode::F(9) => {
+                self.open_raw_enml_modal();
+                return;
+            }
+            KeyCode::Char('x') if alt => {
+                self.open_raw_enml_modal();
+                return;
+            }
             KeyCode::Char('p') if alt => {
                 self.open_preferences_modal();
                 return;
@@ -1928,6 +1967,7 @@ impl App {
             KeyCode::Char('r') if !ctrl => self.open_rename_modal(),
             KeyCode::Char('u') if !ctrl => self.open_source_url_modal(),
             KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
+            KeyCode::Char('x') if !ctrl => self.open_raw_enml_modal(),
             KeyCode::Char(digit @ '1'..='9')
                 if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -1961,6 +2001,7 @@ impl App {
             KeyCode::Char('R') => self.execute_search(),
             KeyCode::Char('r') if ctrl => self.execute_search(),
             KeyCode::Char('c') if !ctrl => self.open_create_note_modal(),
+            KeyCode::Char('x') if !ctrl => self.open_raw_enml_modal(),
             KeyCode::Char(digit @ '1'..='9')
                 if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
@@ -2033,6 +2074,29 @@ impl App {
                 ) {
                     self.modal = ModalState::Help;
                 }
+            }
+            ModalState::RawEnml(mut m) => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                let page = self
+                    .geometry
+                    .modal_inner
+                    .map_or(10, |inner| usize::from(inner.height.max(2) - 1));
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'x') | KeyCode::F(9) => {
+                        return;
+                    }
+                    KeyCode::Char('d') if ctrl => m.scroll += page / 2,
+                    KeyCode::Char('u') if ctrl => m.scroll = m.scroll.saturating_sub(page / 2),
+                    KeyCode::Down | KeyCode::Char('j') => m.scroll += 1,
+                    KeyCode::Up | KeyCode::Char('k') => m.scroll = m.scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => m.scroll += page,
+                    KeyCode::PageUp => m.scroll = m.scroll.saturating_sub(page),
+                    KeyCode::Home | KeyCode::Char('g') => m.scroll = 0,
+                    KeyCode::End | KeyCode::Char('G') => m.scroll = usize::MAX,
+                    _ => {}
+                }
+                m.scroll = m.scroll.min(self.geometry.raw_enml_max_scroll);
+                self.modal = ModalState::RawEnml(m);
             }
             ModalState::Preferences(mut pm) => match key.code {
                 KeyCode::Esc | KeyCode::Char('q' | 'p') | KeyCode::F(7) => {}
@@ -2275,6 +2339,11 @@ impl App {
                     return;
                 }
 
+                if rect_contains(self.geometry.enml_hit, col, row) {
+                    self.open_raw_enml_modal();
+                    return;
+                }
+
                 if rect_contains(self.geometry.vim_area, col, row) {
                     self.focus = FocusTarget::RightVim;
                     let vim_area = self.geometry.vim_area;
@@ -2408,11 +2477,15 @@ impl App {
                 }
             }
             MouseEventKind::ScrollUp => match &mut self.modal {
+                ModalState::RawEnml(m) => m.scroll = m.scroll.saturating_sub(3),
                 ModalState::TagEditor(tm) => tm.cursor = tm.cursor.saturating_sub(1),
                 ModalState::NotebookPicker(nm) => nm.cursor = nm.cursor.saturating_sub(1),
                 _ => {}
             },
             MouseEventKind::ScrollDown => match &mut self.modal {
+                ModalState::RawEnml(m) => {
+                    m.scroll = (m.scroll + 3).min(self.geometry.raw_enml_max_scroll);
+                }
                 ModalState::TagEditor(tm) => {
                     let len = tm.visible_rows(&self.tags).len();
                     if tm.cursor + 1 < len {
@@ -3624,5 +3697,36 @@ mod tests {
         assert_eq!(app.search_input.text, " three");
         assert_eq!(app.search_input.cursor_chars, 0);
         assert_eq!(app.focus, FocusTarget::SearchInput);
+    }
+
+    #[test]
+    fn raw_enml_waits_for_the_note_to_load() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_terminal_event(key(KeyCode::F(9), KeyModifiers::NONE));
+        assert!(
+            matches!(app.modal, ModalState::None),
+            "no note, nothing to show"
+        );
+
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("g1", "One")],
+            },
+        });
+        app.note_cache.remove(&NoteGuid::from("g1"));
+        app.handle_terminal_event(key(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert!(matches!(app.modal, ModalState::None));
+        assert_eq!(app.status_error.as_deref(), Some(NOTE_NOT_LOADED_MESSAGE));
+
+        app.note_cache.insert(NoteGuid::from("g1"), detail("g1"));
+        app.handle_terminal_event(key(KeyCode::Char('x'), KeyModifiers::ALT));
+        let ModalState::RawEnml(m) = &app.modal else {
+            panic!("Alt+x should open the raw ENML view, got {:?}", app.modal);
+        };
+        assert_eq!(m.enml, "<en-note><div>body</div></en-note>");
+        app.handle_terminal_event(key(KeyCode::F(9), KeyModifiers::NONE));
+        assert!(matches!(app.modal, ModalState::None), "F9 closes it again");
     }
 }
