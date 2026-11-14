@@ -410,6 +410,9 @@ pub struct App {
     /// Replies that would change the selected note, and so close Vim, held back while
     /// Vim is in use. Applied in order once it is safe (`replay_deferred_replies`).
     deferred_replies: Vec<WorkerEvent>,
+    /// Title each note had before a rename Evernote has not confirmed yet, to put back if
+    /// the rename fails. The new title is shown and sent with every save meanwhile.
+    pending_renames: HashMap<NoteGuid, String>,
 
     pub preferences: Preferences,
     pub preferences_path: Option<PathBuf>,
@@ -476,6 +479,7 @@ impl App {
             unsynced: HashMap::new(),
             quit_after_sync: false,
             deferred_replies: Vec::new(),
+            pending_renames: HashMap::new(),
 
             preferences,
             preferences_path,
@@ -700,7 +704,12 @@ impl App {
                 (guid.clone(), note.title.clone(), note.enml.clone())
             })
             .collect();
-        for (guid, title, enml) in due {
+        for (guid, stored_title, enml) in due {
+            // A rename since the failed save must not be undone by the retry.
+            let title = self
+                .note_cache
+                .get(&guid)
+                .map_or(stored_title, |detail| detail.title.clone());
             self.begin_saving("Retrying save");
             let _ = self
                 .cmd_tx
@@ -789,6 +798,30 @@ impl App {
         for evt in std::mem::take(&mut self.deferred_replies) {
             self.handle_worker_event(evt);
         }
+    }
+
+    fn local_title(&self, guid: &NoteGuid) -> Option<String> {
+        self.note_cache
+            .get(guid)
+            .map(|detail| detail.title.clone())
+            .or_else(|| {
+                self.notes
+                    .iter()
+                    .find(|note| &note.guid == guid)
+                    .map(|note| note.title.clone())
+            })
+    }
+
+    /// Shows `title` everywhere the note appears, and makes later saves send it.
+    fn set_local_title(&mut self, guid: &NoteGuid, title: &str) {
+        if let Some(detail) = self.note_cache.get_mut(guid) {
+            detail.title = title.to_owned();
+        }
+        if let Some(note) = self.notes.iter_mut().find(|note| &note.guid == guid) {
+            note.title = title.to_owned();
+        }
+        self.sync_history_note(guid);
+        self.remember_current_screen();
     }
 
     pub fn handle_worker_event(&mut self, evt: WorkerEvent) {
@@ -978,22 +1011,45 @@ impl App {
                 self.remember_current_screen();
                 self.finish_saving("Notebook updated");
             }
+            WorkerEvent::RenameFailed {
+                guid,
+                new_title,
+                message,
+            } => {
+                // Put the old title back, unless a newer rename has replaced this one.
+                if self.local_title(&guid).as_deref() == Some(new_title.as_str())
+                    && let Some(old) = self.pending_renames.remove(&guid)
+                {
+                    self.set_local_title(&guid, &old);
+                }
+                self.save_indicator = SaveIndicator::Failed {
+                    message: format!("Rename failed: {message}"),
+                    until: Instant::now() + ERROR_BADGE_DURATION,
+                };
+            }
             WorkerEvent::NoteRenamed {
                 guid,
                 new_title,
                 updated,
             } => {
-                if let Some(detail) = self.note_cache.get_mut(&guid) {
-                    detail.title.clone_from(&new_title);
-                    if updated.is_some() {
-                        detail.updated = updated;
-                    }
+                if self.local_title(&guid).as_deref() == Some(new_title.as_str()) {
+                    self.pending_renames.remove(&guid);
+                } else if self.pending_renames.contains_key(&guid) {
+                    // An older rename landed while a newer one is on its way: the newer title
+                    // stays, and this one is now what to fall back to.
+                    self.pending_renames.insert(guid.clone(), new_title.clone());
+                } else {
+                    self.set_local_title(&guid, &new_title);
                 }
-                if let Some(sum) = self.notes.iter_mut().find(|n| n.guid == guid) {
-                    sum.title = new_title;
-                    if updated.is_some() {
-                        sum.updated = updated;
-                    }
+                if let Some(detail) = self.note_cache.get_mut(&guid)
+                    && updated.is_some()
+                {
+                    detail.updated = updated;
+                }
+                if let Some(sum) = self.notes.iter_mut().find(|n| n.guid == guid)
+                    && updated.is_some()
+                {
+                    sum.updated = updated;
                 }
                 self.sync_history_note(&guid);
                 self.remember_current_screen();
@@ -1947,6 +2003,10 @@ impl App {
                         if !val.is_empty()
                             && let Some(guid) = pm.note_guid
                         {
+                            if let Some(old) = self.local_title(&guid) {
+                                self.pending_renames.entry(guid.clone()).or_insert(old);
+                            }
+                            self.set_local_title(&guid, &val);
                             self.begin_saving("Renaming note");
                             let _ = self.cmd_tx.send(WorkerCommand::RenameNote {
                                 guid,
@@ -2737,6 +2797,66 @@ mod tests {
         assert_eq!(app.notes[0].guid.as_str(), "g-9");
         assert_eq!(app.active_query, "later");
         assert_eq!(app.status_error, None);
+    }
+
+    fn rename(app: &mut App, rx: &mpsc::Receiver<WorkerCommand>, title: &str) {
+        app.open_rename_modal();
+        let ModalState::TextPrompt(prompt) = &mut app.modal else {
+            panic!("rename prompt should open");
+        };
+        prompt.input = TextInput::new(title);
+        app.handle_terminal_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        match rx.try_recv() {
+            Ok(WorkerCommand::RenameNote { new_title, .. }) => assert_eq!(new_title, title),
+            other => panic!("expected RenameNote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn saves_after_a_rename_send_the_new_title_and_a_failed_rename_is_undone() {
+        let (mut app, rx, guid, md) = app_with_loaded_note();
+        let original = app.note_cache[&guid].title.clone();
+
+        rename(&mut app, &rx, "Renamed");
+        assert_eq!(
+            app.notes[0].title, "Renamed",
+            "shown before Evernote confirms"
+        );
+        app.save_markdown_from_vim(&guid, &format!("{md}\nmore\n"));
+        match rx.try_recv() {
+            Ok(WorkerCommand::SaveContent { title, .. }) => assert_eq!(title, "Renamed"),
+            other => panic!("expected SaveContent, got {other:?}"),
+        }
+
+        app.handle_worker_event(WorkerEvent::RenameFailed {
+            guid: guid.clone(),
+            new_title: "Renamed".to_owned(),
+            message: "boom".to_owned(),
+        });
+        assert_eq!(app.notes[0].title, original);
+        assert_eq!(app.note_cache[&guid].title, original);
+    }
+
+    #[test]
+    fn an_older_rename_landing_late_keeps_the_newer_title() {
+        let (mut app, rx, guid, _md) = app_with_loaded_note();
+        rename(&mut app, &rx, "Second");
+        rename(&mut app, &rx, "Third");
+
+        app.handle_worker_event(WorkerEvent::NoteRenamed {
+            guid: guid.clone(),
+            new_title: "Second".to_owned(),
+            updated: None,
+        });
+        assert_eq!(app.notes[0].title, "Third");
+
+        // If the newer one fails, the title falls back to the one Evernote has.
+        app.handle_worker_event(WorkerEvent::RenameFailed {
+            guid: guid.clone(),
+            new_title: "Third".to_owned(),
+            message: "boom".to_owned(),
+        });
+        assert_eq!(app.notes[0].title, "Second");
     }
 
     fn app_with_loaded_note() -> (App, mpsc::Receiver<WorkerCommand>, NoteGuid, String) {

@@ -113,6 +113,12 @@ pub enum WorkerEvent {
         notebook_guid: NotebookGuid,
         updated: Option<TimestampMs>,
     },
+    /// `new_title` tells which rename failed when the same note was renamed twice.
+    RenameFailed {
+        guid: NoteGuid,
+        new_title: String,
+        message: String,
+    },
     NoteRenamed {
         guid: NoteGuid,
         new_title: String,
@@ -300,10 +306,10 @@ impl BackendHandle {
                                     });
                                 }
                                 Err(e) => {
-                                    evt_tx.send(WorkerEvent::Error {
-                                        context: "Rename note".to_owned(),
+                                    evt_tx.send(WorkerEvent::RenameFailed {
+                                        guid,
+                                        new_title,
                                         message: e.to_string(),
-                                        was_save: true,
                                     });
                                 }
                             }
