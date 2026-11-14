@@ -144,19 +144,23 @@ impl ParsedSearch {
             if let Some(nb) = resolve_notebook(nb_query, known_notebooks) {
                 resolved_notebook_guid = Some(nb.guid.clone());
             } else {
-                parts.push(format_field_expr("notebook", nb_query, false));
+                parts.extend(format_field_expr("notebook", nb_query, false));
             }
         }
 
         for tag in &self.tags {
-            parts.push(format_field_expr("tag", &tag.name, tag.negated));
+            parts.extend(format_field_expr("tag", &tag.name, tag.negated));
         }
 
         for term in &self.terms {
-            if term.quoted || term.text.contains(char::is_whitespace) {
-                parts.push(format!("\"{}\"", escape_quotes(&term.text)));
+            let text = without_quotes(&term.text);
+            if text.trim().is_empty() {
+                continue;
+            }
+            if term.quoted || text.contains(char::is_whitespace) {
+                parts.push(format!("\"{text}\""));
             } else {
-                parts.push(term.text.clone());
+                parts.push(text);
             }
         }
 
@@ -210,17 +214,25 @@ fn is_notebook_prefix(prefix: &str) -> bool {
     prefix.eq_ignore_ascii_case("notebook") || prefix.eq_ignore_ascii_case("n")
 }
 
-fn format_field_expr(field: &str, value: &str, negated: bool) -> String {
+/// `None` when nothing is left to search for once quotes are dropped.
+fn format_field_expr(field: &str, value: &str, negated: bool) -> Option<String> {
+    let value = without_quotes(value);
+    if value.trim().is_empty() {
+        return None;
+    }
     let sign = if negated { "-" } else { "" };
-    if value.contains(char::is_whitespace) {
-        format!("{sign}{field}:\"{}\"", escape_quotes(value))
+    Some(if value.contains(char::is_whitespace) {
+        format!("{sign}{field}:\"{value}\"")
     } else {
         format!("{sign}{field}:{value}")
-    }
+    })
 }
 
-fn escape_quotes(text: &str) -> String {
-    text.replace('"', "\\\"")
+/// Evernote's search grammar has no escape for `"` (a backslash is not one), so a quote
+/// inside a value would end the phrase early or leave it open and swallow the rest of the
+/// query. Evernote cannot match a literal quote anyway, so drop them.
+fn without_quotes(text: &str) -> String {
+    text.replace('"', "")
 }
 
 fn tokenize(input: &str) -> Vec<RawToken> {
@@ -293,6 +305,37 @@ fn tokenize(input: &str) -> Vec<RawToken> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quotes_inside_values_never_unbalance_the_query() {
+        let words = |q: &str| ParsedSearch::parse(q).compile(&[]).words;
+        assert_eq!(words(r#"t:foo"bar baz"#).as_deref(), Some("tag:foobar baz"));
+        assert_eq!(
+            words(r#"n "my \"nb\" x""#).as_deref(),
+            Some(r#"notebook:"my nb x""#)
+        );
+        assert_eq!(words(r#"x"y"#).as_deref(), Some("xy"));
+        assert_eq!(
+            words(r#"say "hi there""#).as_deref(),
+            Some(r#"say "hi there""#)
+        );
+        // Nothing left once the quotes are gone: no empty `tag:` or `""`.
+        assert_eq!(words(r#"t:"\"" "\"""#), None);
+        for q in [
+            r#"t:foo"bar baz"#,
+            r#"n "my \"nb\" x""#,
+            r#"x"y"#,
+            r#"a "b c" d"e"#,
+        ] {
+            let compiled = words(q).unwrap_or_default();
+            assert_eq!(
+                compiled.matches('"').count() % 2,
+                0,
+                "{q:?} -> {compiled:?}"
+            );
+            assert!(!compiled.contains('\\'), "{q:?} -> {compiled:?}");
+        }
+    }
 
     fn sample_notebooks() -> Vec<Notebook> {
         vec![
