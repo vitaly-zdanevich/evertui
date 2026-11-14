@@ -257,6 +257,7 @@ impl TextInput {
     }
 
     /// Emacs / bash (readline) editing keys: `Ctrl+A`/`Ctrl+E` line start/end, `Ctrl+U` clear,
+    /// `Ctrl+W` delete the word before the cursor,
     /// `Alt+Left`/`Alt+Right` back / forward one word.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -264,6 +265,14 @@ impl TextInput {
         match key.code {
             KeyCode::Char('u') if ctrl => {
                 self.clear();
+                true
+            }
+            KeyCode::Char('w') if ctrl => {
+                let start = self.whitespace_word_start_before_cursor();
+                let from = self.byte_index_at(start);
+                let to = self.byte_index_at(self.cursor_chars);
+                self.text.replace_range(from..to, "");
+                self.cursor_chars = start;
                 true
             }
             KeyCode::Char('a') if ctrl => {
@@ -339,6 +348,20 @@ impl TextInput {
             pos -= 1;
         }
         while pos > 0 && chars[pos - 1].is_alphanumeric() {
+            pos -= 1;
+        }
+        pos
+    }
+
+    /// Like readline `unix-word-rubout` (bash `Ctrl+W`): start of the whitespace-delimited
+    /// word before the cursor, so `tag:work` goes in one press.
+    fn whitespace_word_start_before_cursor(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut pos = self.cursor_chars.min(chars.len());
+        while pos > 0 && chars[pos - 1].is_whitespace() {
+            pos -= 1;
+        }
+        while pos > 0 && !chars[pos - 1].is_whitespace() {
             pos -= 1;
         }
         pos
@@ -3573,6 +3596,33 @@ mod tests {
         assert_eq!(cursor(&app), 17);
 
         assert_eq!(app.search_input.text, "t:work  rust-lang");
+        assert_eq!(app.focus, FocusTarget::SearchInput);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_cursor_like_bash() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.focus = FocusTarget::SearchInput;
+        app.search_input = TextInput::new("rust  t:wörk ");
+        let ctrl_w = key(KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+        app.handle_terminal_event(ctrl_w.clone());
+        assert_eq!(app.search_input.text, "rust  ");
+        assert_eq!(app.search_input.cursor_chars, 6);
+
+        app.search_input = TextInput::new("one two three");
+        app.search_input.cursor_chars = 7;
+        app.handle_terminal_event(ctrl_w.clone());
+        assert_eq!(
+            app.search_input.text, "one  three",
+            "only text before the cursor"
+        );
+        assert_eq!(app.search_input.cursor_chars, 4);
+        app.handle_terminal_event(ctrl_w.clone());
+        app.handle_terminal_event(ctrl_w.clone());
+        assert_eq!(app.search_input.text, " three");
+        assert_eq!(app.search_input.cursor_chars, 0);
         assert_eq!(app.focus, FocusTarget::SearchInput);
     }
 }
