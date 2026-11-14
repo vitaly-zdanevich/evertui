@@ -221,6 +221,8 @@ impl EdamEvernoteService {
         Ok(tags)
     }
 
+    /// All names in `tag_guids` order, or an empty list if any of them is unknown: a partial
+    /// list would let the tag editor drop the missing tags when it saves.
     fn resolve_tag_names(&mut self, note_guid: &NoteGuid, tag_guids: &[TagGuid]) -> Vec<String> {
         if tag_guids.is_empty() {
             return Vec::new();
@@ -249,12 +251,10 @@ impl EdamEvernoteService {
         }
         let token = self.auth.token().to_owned();
         let guid = note_guid.as_str().to_owned();
-        if let Ok(fetched) =
-            self.call_note_store(|ns| ns.get_note_tag_names(token.clone(), guid.clone()))
-        {
-            return fetched;
+        match self.call_note_store(|ns| ns.get_note_tag_names(token.clone(), guid.clone())) {
+            Ok(fetched) if fetched.len() == tag_guids.len() => fetched,
+            _ => Vec::new(),
         }
-        names
     }
 }
 

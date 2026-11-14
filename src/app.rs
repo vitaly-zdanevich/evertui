@@ -37,6 +37,9 @@ pub const QUIT_AFTER_SYNC_MESSAGE: &str = "Saving first; q again: quit, lose it"
 /// Shown while a reply that would close the note open in Vim waits.
 pub const DEFERRED_REPLY_MESSAGE: &str = "Results ready: leave Vim to see them";
 
+/// The tag editor replaces a note's whole tag set, so it must not open with names missing.
+pub const TAGS_NOT_LOADED_MESSAGE: &str = "Tag names not loaded yet: try again";
+
 /// Fits the status bar's 38 columns.
 pub const UNSAVED_VIM_MESSAGE: &str = "Unsaved in Vim: :w save, :q! discard";
 
@@ -1470,11 +1473,39 @@ impl App {
         let Some(detail) = self.selected_detail().cloned() else {
             return;
         };
+        // Saving replaces the note's whole tag set, so every current tag must be listed.
+        // A note loaded before the tag list arrived may still lack its names.
+        let names = if detail.tag_names.len() == detail.tag_guids.len() {
+            Some(detail.tag_names)
+        } else {
+            detail
+                .tag_guids
+                .iter()
+                .map(|guid| {
+                    self.tags
+                        .iter()
+                        .find(|tag| &tag.guid == guid)
+                        .map(|tag| tag.name.clone())
+                })
+                .collect::<Option<Vec<String>>>()
+        };
+        let Some(selected_tags) = names else {
+            self.status_error = Some(TAGS_NOT_LOADED_MESSAGE.to_owned());
+            // Reload unless a load is still on its way (a tag made elsewhere, or a failed load).
+            if self.catalog_ready {
+                self.catalog_ready = false;
+                let _ = self.cmd_tx.send(WorkerCommand::LoadCatalog);
+            }
+            return;
+        };
+        if let Some(cached) = self.note_cache.get_mut(&detail.guid) {
+            cached.tag_names.clone_from(&selected_tags);
+        }
         self.modal = ModalState::TagEditor(TagEditorModal {
             note_guid: detail.guid,
             note_title: detail.title,
             filter: TextInput::default(),
-            selected_tags: detail.tag_names,
+            selected_tags,
             cursor: 0,
         });
     }
@@ -2857,6 +2888,62 @@ mod tests {
             message: "boom".to_owned(),
         });
         assert_eq!(app.notes[0].title, "Second");
+    }
+
+    #[test]
+    fn tag_editor_opens_only_when_every_tag_name_is_known() {
+        use crate::domain::TagGuid;
+        let (tx, rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![summary("g-1", "One")],
+            },
+        });
+        // Loaded before the tag list: Evernote sent the tag GUIDs, but no names.
+        let mut note = detail("g-1");
+        note.tag_guids = vec![TagGuid::from("t-1"), TagGuid::from("t-2")];
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note,
+        });
+        while rx.try_recv().is_ok() {}
+
+        app.open_tag_modal();
+        assert!(
+            matches!(app.modal, ModalState::None),
+            "must not open with no names"
+        );
+        assert_eq!(app.status_error.as_deref(), Some(TAGS_NOT_LOADED_MESSAGE));
+        assert!(
+            rx.try_recv().is_err(),
+            "the first tag list load is still on its way"
+        );
+
+        // The tag list arrives but misses t-2 (made on another device): still refused,
+        // and the list is loaded again.
+        let tag = |guid: &str, name: &str| Tag {
+            guid: TagGuid::from(guid),
+            name: name.to_owned(),
+        };
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: vec![tag("t-1", "work")],
+        });
+        app.open_tag_modal();
+        assert!(matches!(app.modal, ModalState::None));
+        assert!(matches!(rx.try_recv(), Ok(WorkerCommand::LoadCatalog)));
+
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: vec![tag("t-1", "work"), tag("t-2", "home")],
+        });
+        app.open_tag_modal();
+        let ModalState::TagEditor(editor) = &app.modal else {
+            panic!("tag editor should open once every name is known");
+        };
+        assert_eq!(editor.selected_tags, ["work", "home"]);
     }
 
     fn app_with_loaded_note() -> (App, mpsc::Receiver<WorkerCommand>, NoteGuid, String) {
