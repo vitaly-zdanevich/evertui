@@ -1115,19 +1115,6 @@ fn hard_wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometry) {
-    let popup = centered_rect(area, 78, 24);
-    let inner = render_modal_surface(
-        frame,
-        popup,
-        Span::styled(
-            "evertui Help",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        geom,
-    );
-
     let lines = vec![
         Line::from(Span::styled(
             "Search Syntax (/ or F3 / Alt+s):",
@@ -1172,6 +1159,20 @@ fn render_help_modal(frame: &mut Frame<'_>, area: Rect, geom: &mut LayoutGeometr
         Line::from("  * Ctrl+\\ or Alt+h            Switch focus to Left Panel"),
         Line::from("  * Drag seam between panels   Resize panels live with mouse"),
     ];
+    // Tall enough for every line (plus the border) when the terminal allows it.
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centered_rect(area, 78, height);
+    let inner = render_modal_surface(
+        frame,
+        popup,
+        Span::styled(
+            "evertui Help",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        geom,
+    );
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1755,6 +1756,28 @@ mod tests {
         assert!(
             matches!(app.modal, ModalState::RawEnml(_)),
             "x opens it too"
+        );
+    }
+
+    #[test]
+    fn help_shows_every_line_when_the_terminal_is_tall_enough() {
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.modal = ModalState::Help;
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let inner = app.geometry.modal_inner.unwrap();
+        let last_row: String = (inner.x..inner.x + inner.width)
+            .map(|x| {
+                terminal.backend().buffer()[(x, inner.y + inner.height - 1)]
+                    .symbol()
+                    .to_owned()
+            })
+            .collect();
+        assert!(
+            last_row.contains("Drag seam between panels"),
+            "last help line cut off: {last_row:?}"
         );
     }
 }
