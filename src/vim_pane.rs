@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use rustix::fd::OwnedFd;
 use rustix::fs::{MemfdFlags, memfd_create};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
-use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process, waitid};
 use rustix::pty::{OpenptFlags, grantpt, ioctl_tiocgptpeer, openpt, ptsname, unlockpt};
 use rustix::termios::{Winsize, tcsetwinsize};
 use std::fs::File;
@@ -203,6 +203,19 @@ impl VimSession {
             }
         }
 
+        // `activate` rewrites the note memfd and sends SIGUSR1; this reloads it. `undolevels=-1`
+        // around the reload keeps `u` from going back to the previous (empty) text, and the
+        // filetype is set again because `edit!` re-runs detection on the extension-less path.
+        // `cursor()` instead of `normal! gg`: `:normal` would swallow the rest of the line.
+        cmd.arg("-c").arg(
+            "silent! autocmd SigUSR1 * setlocal undolevels=-1 | silent! edit! \
+             | setlocal undolevels< filetype=markdown | call cursor(1, 1) | redraw!",
+        );
+        // Last `-c`, so it runs once the SIGUSR1 handler exists: before that the signal's
+        // default action would kill Vim. `has_unsaved_changes` reads `0` as clean.
+        cmd.arg("-c")
+            .arg(format!("call writefile(['0'], '{ram_modified_proc_path}')"));
+
         cmd.arg(&ram_buf_proc_path)
             .stdin(Stdio::from(slave_in))
             .stdout(Stdio::from(slave_out))
@@ -303,6 +316,46 @@ impl VimSession {
         } else {
             None
         }
+    }
+
+    /// Starts Vim on an empty note so `activate` can later show a note without the startup
+    /// wait.
+    pub fn spawn_spare(rows: u16, cols: u16, waker: Waker) -> io::Result<Self> {
+        Self::spawn(NoteGuid::from(""), "", rows, cols, waker)
+    }
+
+    /// Vim has finished starting up and can take `activate`.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.modified_flag_file
+            .metadata()
+            .is_ok_and(|meta| meta.len() > 0)
+    }
+
+    /// Loads `markdown` into this idle, ready session: rewrites its RAM file and has Vim reload
+    /// it (SIGUSR1). Only for a session nobody has typed into, such as a spare.
+    pub fn activate(&mut self, note_guid: NoteGuid, markdown: &str) -> io::Result<()> {
+        if !self.is_ready() || self.has_exited() {
+            return Err(io::Error::other("Vim is not ready"));
+        }
+        self.note_ram_file.set_len(0)?;
+        self.note_ram_file.write_all_at(markdown.as_bytes(), 0)?;
+        self.last_saves_len = self.saves_seq_file.metadata()?.len();
+        let pid = i32::try_from(self.child.id())
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| io::Error::other("invalid Vim pid"))?;
+        kill_process(pid, Signal::USR1)?;
+        // Vim waiting for input only runs the SigUSR1 autocmd once a key arrives. Ctrl-\
+        // Ctrl-N ("go to Normal mode") is a no-op for an idle Vim, and wakes it.
+        self.write_raw(b"\x1c\x0e");
+        self.note_guid = note_guid;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// Returns `true` while the Vim buffer has changes that `:w` has not saved yet.
@@ -858,6 +911,62 @@ mod tests {
             session.has_exited(),
             "Vim should exit cleanly on :q; screen was:\n{}",
             session.parser.screen().contents()
+        );
+    }
+
+    fn wait_until(
+        session: &mut VimSession,
+        what: &str,
+        mut done: impl FnMut(&mut VimSession) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            session.drain_output();
+            if done(session) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "timed out waiting for {what}; screen:\n{}",
+            session.parser.screen().contents()
+        );
+    }
+
+    #[test]
+    fn spare_vim_takes_a_note_without_restarting() {
+        let mut spare = VimSession::spawn_spare(24, 80, Waker::noop()).expect("spawn spare Vim");
+        let pid = spare.pid();
+        wait_until(&mut spare, "the spare to be ready", |s| s.is_ready());
+        // A real spare sits idle for a while; idle Vim handles the signal only once woken.
+        thread::sleep(Duration::from_millis(300));
+        spare.drain_output();
+
+        spare
+            .activate(NoteGuid::from("g-7"), "Spare line one\nSpare line two\n")
+            .expect("activate");
+        assert_eq!(spare.note_guid.as_str(), "g-7");
+        wait_until(&mut spare, "the note on screen", |s| {
+            s.parser.screen().contents().contains("Spare line one")
+        });
+        assert_eq!(spare.pid(), pid, "the same Vim process shows the note");
+        assert!(!spare.has_unsaved_changes());
+
+        // `u` must not go back to the empty text the spare started with.
+        spare.write_raw(b"uu");
+        thread::sleep(Duration::from_millis(200));
+        spare.drain_output();
+        assert!(spare.parser.screen().contents().contains("Spare line one"));
+
+        spare.write_raw(b"GoAdded\x1b:w\r");
+        let mut saved = None;
+        wait_until(&mut spare, "the save", |s| {
+            saved = s.poll_saved_markdown();
+            saved.is_some()
+        });
+        assert_eq!(
+            saved.as_deref(),
+            Some("Spare line one\nSpare line two\nAdded\n")
         );
     }
 

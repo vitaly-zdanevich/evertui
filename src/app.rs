@@ -40,6 +40,9 @@ pub const DEFERRED_REPLY_MESSAGE: &str = "Results ready: leave Vim to see them";
 /// The tag editor replaces a note's whole tag set, so it must not open with names missing.
 pub const TAGS_NOT_LOADED_MESSAGE: &str = "Tag names not loaded yet: try again";
 
+/// A spare Vim that dies this many times is not restarted again (Vim missing or broken).
+const SPARE_VIM_MAX_FAILURES: u8 = 3;
+
 /// Fits the status bar's 38 columns.
 pub const UNSAVED_VIM_MESSAGE: &str = "Unsaved in Vim: :w save, :q! discard";
 
@@ -416,6 +419,10 @@ pub struct App {
     /// Title each note had before a rename Evernote has not confirmed yet, to put back if
     /// the rename fails. The new title is shown and sent with every save meanwhile.
     pending_renames: HashMap<NoteGuid, String>,
+    /// An idle Vim started ahead of time, so opening a note skips Vim's startup.
+    spare_vim: Option<VimSession>,
+    spare_vim_enabled: bool,
+    spare_vim_failures: u8,
 
     pub preferences: Preferences,
     pub preferences_path: Option<PathBuf>,
@@ -483,6 +490,9 @@ impl App {
             quit_after_sync: false,
             deferred_replies: Vec::new(),
             pending_renames: HashMap::new(),
+            spare_vim: None,
+            spare_vim_enabled: false,
+            spare_vim_failures: 0,
 
             preferences,
             preferences_path,
@@ -604,7 +614,50 @@ impl App {
         self.poll_vim_activity();
     }
 
+    /// Keep one idle Vim ready from now on. Off by default so tests do not start Vim.
+    pub fn enable_spare_vim(&mut self) {
+        self.spare_vim_enabled = true;
+        self.maintain_spare_vim();
+    }
+
+    /// Feeds the spare's output into its screen (so it is current once shown), and starts a
+    /// new spare when there is none or the old one died.
+    fn maintain_spare_vim(&mut self) {
+        if !self.spare_vim_enabled {
+            return;
+        }
+        if let Some(spare) = &mut self.spare_vim {
+            spare.drain_output();
+            if spare.has_exited() {
+                self.spare_vim = None;
+                self.spare_vim_failures = self.spare_vim_failures.saturating_add(1);
+            }
+        }
+        if self.spare_vim.is_none() && self.spare_vim_failures < SPARE_VIM_MAX_FAILURES {
+            let rows = self.geometry.vim_area.height.max(12);
+            let cols = self.geometry.vim_area.width.max(40);
+            match VimSession::spawn_spare(rows, cols, self.waker.clone()) {
+                Ok(spare) => self.spare_vim = Some(spare),
+                // Opening a note still starts Vim directly and reports its error there.
+                Err(_) => self.spare_vim_failures = SPARE_VIM_MAX_FAILURES,
+            }
+        }
+    }
+
+    /// Hands out the spare if it is ready and takes the note; the next spare starts on the
+    /// next loop pass.
+    fn take_spare_vim(&mut self, guid: &NoteGuid, markdown: &str) -> Option<VimSession> {
+        let mut spare = self.spare_vim.take()?;
+        if !spare.is_ready() {
+            self.spare_vim = Some(spare);
+            return None;
+        }
+        // On failure the spare is dropped (killed) and replaced.
+        spare.activate(guid.clone(), markdown).ok().map(|()| spare)
+    }
+
     pub fn poll_vim_activity(&mut self) {
+        self.maintain_spare_vim();
         let mut saved_payload: Option<(NoteGuid, String)> = None;
         let mut exited_guid: Option<NoteGuid> = None;
 
@@ -1426,6 +1479,11 @@ impl App {
 
         let rows = self.geometry.vim_area.height.max(12);
         let cols = self.geometry.vim_area.width.max(40);
+        if let Some(mut session) = self.take_spare_vim(guid, &md) {
+            session.resize(rows, cols);
+            self.vim_session = Some(session);
+            return;
+        }
         match VimSession::spawn(guid.clone(), &md, rows, cols, self.waker.clone()) {
             Ok(session) => {
                 self.vim_session = Some(session);
@@ -1438,11 +1496,11 @@ impl App {
 
     pub fn sync_vim_size(&mut self) {
         let area = self.geometry.vim_area;
-        if area.width > 0
-            && area.height > 0
-            && let Some(vim) = &mut self.vim_session
-        {
-            vim.resize(area.height, area.width);
+        if area.width > 0 && area.height > 0 {
+            // The spare too, so it needs no resize (and redraw) when it is shown.
+            for vim in self.vim_session.iter_mut().chain(self.spare_vim.iter_mut()) {
+                vim.resize(area.height, area.width);
+            }
         }
     }
 
@@ -3001,6 +3059,29 @@ mod tests {
         });
         assert!(!app.loading_list);
         assert_eq!(app.status_error.as_deref(), Some("Search: boom"));
+    }
+
+    #[test]
+    fn opening_a_note_uses_the_ready_spare_vim_and_starts_the_next() {
+        let (mut app, _rx, guid, _md) = app_with_loaded_note();
+        app.enable_spare_vim();
+        wait_for(&mut app, "the spare Vim to be ready", |app| {
+            app.spare_vim.as_ref().is_some_and(VimSession::is_ready)
+        });
+        let spare_pid = app.spare_vim.as_ref().unwrap().pid();
+
+        app.open_selected_in_vim();
+        let vim = app.vim_session.as_ref().expect("note open in Vim");
+        assert_eq!(
+            vim.pid(),
+            spare_pid,
+            "the spare shows the note: no new Vim started"
+        );
+        assert_eq!(vim.note_guid, guid);
+
+        app.poll_vim_activity();
+        let next = app.spare_vim.as_ref().expect("a new spare is started");
+        assert_ne!(next.pid(), spare_pid);
     }
 
     fn app_with_loaded_note() -> (App, mpsc::Receiver<WorkerCommand>, NoteGuid, String) {

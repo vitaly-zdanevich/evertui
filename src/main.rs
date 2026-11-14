@@ -74,6 +74,7 @@ fn try_main() -> Result<(), String> {
         opts.initial_query,
     );
     app.set_waker(waker);
+    app.enable_spare_vim();
     spawn_terminal_reader(loop_tx).map_err(|e| format!("Input thread failed: {e}"))?;
 
     let run_res = run_event_loop(&mut terminal, &mut app, &backend, &loop_rx, &wake_pending);
