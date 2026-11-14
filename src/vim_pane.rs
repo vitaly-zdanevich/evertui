@@ -148,11 +148,14 @@ impl VimSession {
             "autocmd BufWritePost <buffer> silent! call writefile(['saved'], '{ram_seq_proc_path}', 'a')"
         );
         // Vim has no `BufModifiedSet` (that is Neovim), so refresh the flag after every edit
-        // (`u` back to the saved text included) and after `:w`. Without the `a` flag `writefile`
-        // truncates, so the memfd always holds the latest state. `silent!` keeps an older Vim that
-        // lacks one of these events from stopping at a "Press ENTER" prompt.
+        // (`u` back to the saved text included) and after `:w`. `InsertLeave` too: before Vim
+        // 9.1.0230 (Ubuntu 24.04 ships 9.1.0016) leaving Insert mode skipped `TextChanged` when
+        // the inserted text came in one burst (a paste, or keys sent at once), and no
+        // `TextChangedI` fired for it either. Without the `a` flag `writefile` truncates, so the
+        // memfd always holds the latest state. `silent!` keeps an older Vim that lacks one of
+        // these events from stopping at a "Press ENTER" prompt.
         let modified_autocmd = format!(
-            "silent! autocmd TextChanged,TextChangedI,TextChangedP,BufWritePost <buffer> silent! call writefile([&modified ? '1' : '0'], '{ram_modified_proc_path}')"
+            "silent! autocmd TextChanged,TextChangedI,TextChangedP,InsertLeave,BufWritePost <buffer> silent! call writefile([&modified ? '1' : '0'], '{ram_modified_proc_path}')"
         );
 
         let mut cmd = if has_setsid() {
