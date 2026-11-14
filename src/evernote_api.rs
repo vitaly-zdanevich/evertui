@@ -26,8 +26,35 @@ use thrift::transport::{TBufferedReadTransport, TBufferedWriteTransport};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
+    /// Evernote refused the request. Sending it again unchanged will fail the same way.
     #[error("{0}")]
     Remote(String),
+    /// Network, timeout or protocol failure: the same request may succeed later.
+    #[error("{0}")]
+    Network(String),
+    /// `RATE_LIMIT_REACHED`: Evernote says how long to wait before the next call.
+    #[error("Evernote RATE_LIMIT_REACHED: retry in {}s", retry_after.as_secs())]
+    RateLimited { retry_after: Duration },
+}
+
+/// Used when Evernote reports a rate limit without saying how long it lasts.
+const DEFAULT_RATE_LIMIT_WAIT: Duration = Duration::from_secs(60);
+
+impl ApiError {
+    /// Whether sending the same request again later can succeed.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        !matches!(self, Self::Remote(_))
+    }
+
+    /// The wait Evernote asked for, when this is a rate limit.
+    #[must_use]
+    pub fn rate_limit_wait(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after } => Some(*retry_after),
+            _ => None,
+        }
+    }
 }
 
 pub struct UpdatedTagsOutcome {
@@ -804,9 +831,21 @@ fn parse_note_store_cache(text: &str) -> Option<ParsedNoteStoreCache> {
 fn map_thrift_error(err: thrift::Error) -> ApiError {
     if let thrift::Error::User(boxed) = &err {
         if let Some(uex) = boxed.downcast_ref::<EDAMUserException>() {
+            if uex.error_code == EDAMErrorCode::RATE_LIMIT_REACHED {
+                return ApiError::RateLimited {
+                    retry_after: DEFAULT_RATE_LIMIT_WAIT,
+                };
+            }
             return ApiError::Remote(format_user_exception(uex));
         }
         if let Some(sex) = boxed.downcast_ref::<EDAMSystemException>() {
+            if sex.error_code == EDAMErrorCode::RATE_LIMIT_REACHED {
+                let retry_after = sex
+                    .rate_limit_duration
+                    .and_then(|secs| u64::try_from(secs).ok())
+                    .map_or(DEFAULT_RATE_LIMIT_WAIT, Duration::from_secs);
+                return ApiError::RateLimited { retry_after };
+            }
             let msg = sex.message.as_deref().unwrap_or("system error");
             return ApiError::Remote(format!(
                 "Evernote system error ({}): {msg}",
@@ -817,6 +856,9 @@ fn map_thrift_error(err: thrift::Error) -> ApiError {
             let id = nf.identifier.as_deref().unwrap_or("item");
             return ApiError::Remote(format!("Not found on Evernote: {id}"));
         }
+    }
+    if should_refresh_note_store(&err) {
+        return ApiError::Network(format!("Evernote connection failed: {err}"));
     }
     ApiError::Remote(format!("Evernote API error: {err}"))
 }
@@ -854,14 +896,45 @@ fn format_user_exception(uex: &EDAMUserException) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
+        ApiError, EDAMErrorCode, EDAMSystemException, EDAMUserException, map_thrift_error,
+    };
+    use super::{
         normalize_source_url, parse_note_store_cache, read_note_store_cache,
         should_refresh_note_store, token_fingerprint, write_note_store_cache,
     };
     use crate::auth::AuthConfig;
+    use std::time::Duration;
     use thrift::{
         ApplicationError, ApplicationErrorKind, ProtocolError, ProtocolErrorKind, TransportError,
         TransportErrorKind,
     };
+
+    #[test]
+    fn errors_say_whether_a_retry_can_help() {
+        let limited = map_thrift_error(thrift::Error::User(Box::new(EDAMSystemException::new(
+            EDAMErrorCode::RATE_LIMIT_REACHED,
+            None,
+            42,
+        ))));
+        assert_eq!(limited.rate_limit_wait(), Some(Duration::from_secs(42)));
+        assert!(limited.is_retryable());
+        // The app's prefetch logic looks for this text.
+        assert!(limited.to_string().contains("RATE_LIMIT_REACHED"));
+
+        let network = map_thrift_error(thrift::Error::Transport(TransportError::new(
+            TransportErrorKind::TimedOut,
+            "timed out",
+        )));
+        assert!(matches!(network, ApiError::Network(_)));
+        assert!(network.is_retryable());
+        assert_eq!(network.rate_limit_wait(), None);
+
+        let refused = map_thrift_error(thrift::Error::User(Box::new(EDAMUserException::new(
+            EDAMErrorCode::ENML_VALIDATION,
+            None,
+        ))));
+        assert!(!refused.is_retryable());
+    }
 
     #[test]
     fn normalize_source_url_trims_clears_and_rejects_invalid_values() {
