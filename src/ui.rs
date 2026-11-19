@@ -366,7 +366,7 @@ fn render_right_note_panel(
     }
 
     let max_header = inner.height.saturating_sub(1).max(1);
-    let header_h = note_header_height(app, max_header);
+    let header_h = note_header_height(app, inner.width, max_header);
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(header_h), Constraint::Min(1)])
@@ -438,26 +438,20 @@ fn render_note_metadata_header(
 
     let detail = app.selected_detail();
 
-    // Row 0: Title (clickable to rename)
+    // Title (clickable to rename; wraps across multiple rows when long)
     let title_str = detail.map_or(summary.title.as_str(), |d| d.title.as_str());
+    let title_lines = build_title_lines(title_str, area.width);
+    let title_rows = u16::try_from(title_lines.len())
+        .unwrap_or(1)
+        .min(area.height);
     geom.title_hit = Rect {
         x: area.x,
         y: area.y,
         width: area.width,
-        height: 1,
+        height: title_rows,
     };
-    let line_title = Line::from(vec![
-        Span::styled(" Title: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            truncate_ascii_dots(title_str, usize::from(area.width.saturating_sub(18))),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  [r]", Style::default().fg(Color::DarkGray)),
-    ]);
 
-    // Row 1: Notebook + Tags (clickable ASCII badges)
+    // Notebook + Tags (clickable ASCII badges)
     let nb_guid = detail
         .and_then(|d| d.notebook_guid.as_ref())
         .or(summary.notebook_guid.as_ref());
@@ -466,9 +460,10 @@ fn render_note_metadata_header(
     let nb_w = u16::try_from(nb_badge.width())
         .unwrap_or(16)
         .min(area.width);
+    let nb_row_y = area.y.saturating_add(title_rows);
     geom.notebook_hit = Rect {
         x: area.x,
-        y: area.y + 1,
+        y: nb_row_y,
         width: nb_w,
         height: 1,
     };
@@ -488,7 +483,7 @@ fn render_note_metadata_header(
     let tags_badge = format!("[Tags: {tags_display} + (t)]");
     geom.tags_hit = Rect {
         x: area.x.saturating_add(nb_w + 1).min(area.x + area.width),
-        y: area.y + 1,
+        y: nb_row_y,
         width: area.width.saturating_sub(nb_w + 1),
         height: 1,
     };
@@ -512,7 +507,7 @@ fn render_note_metadata_header(
         ),
     ]);
 
-    // Row 2: Created | Updated | Attachments | Size. The source URL is one line below.
+    // Created | Updated | Attachments | Size. The source URL is one line below.
     let created = detail
         .and_then(|d| d.created)
         .or(summary.created)
@@ -553,7 +548,8 @@ fn render_note_metadata_header(
     // Clickable only when it fits on the row.
     let enml_x = u16::try_from(line_dates.width()).unwrap_or(u16::MAX);
     let enml_w = u16::try_from(ENML_BUTTON.width()).unwrap_or(u16::MAX);
-    if area.height > 2 && enml_x.saturating_add(enml_w) <= area.width {
+    let dates_row_offset = title_rows.saturating_add(1);
+    if area.height > dates_row_offset && enml_x.saturating_add(enml_w) <= area.width {
         line_dates.push_span(Span::styled(
             ENML_BUTTON,
             Style::default()
@@ -562,15 +558,18 @@ fn render_note_metadata_header(
         ));
         geom.enml_hit = Rect {
             x: area.x + enml_x,
-            y: area.y + 2,
+            y: area.y + dates_row_offset,
             width: enml_w,
             height: 1,
         };
     }
 
-    let meta_height = 3.min(area.height);
+    let meta_height = title_rows.saturating_add(2).min(area.height);
+    let mut meta_lines = title_lines;
+    meta_lines.push(line_nb_tags);
+    meta_lines.push(line_dates);
     frame.render_widget(
-        Paragraph::new(vec![line_title, line_nb_tags, line_dates]),
+        Paragraph::new(meta_lines),
         Rect {
             x: area.x,
             y: area.y,
@@ -598,13 +597,72 @@ fn render_note_metadata_header(
 
 const ENML_BUTTON: &str = "[ENML (x)]";
 
-fn note_header_height(app: &App, max_rows: u16) -> u16 {
-    let rows = if app.selected_detail().is_some() {
-        4
-    } else {
+fn note_header_height(app: &App, width: u16, max_rows: u16) -> u16 {
+    let title_rows = app.selected_summary().map_or(1, |summary| {
+        let title_str = app
+            .selected_detail()
+            .map_or(summary.title.as_str(), |d| d.title.as_str());
+        u16::try_from(build_title_lines(title_str, width).len()).unwrap_or(1)
+    });
+    let extra_rows = if app.selected_detail().is_some() {
         3
+    } else {
+        2
     };
-    rows.min(max_rows).max(1)
+    title_rows.saturating_add(extra_rows).min(max_rows).max(1)
+}
+
+fn build_title_lines(title: &str, area_width: u16) -> Vec<Line<'static>> {
+    const PREFIX: &str = " Title: ";
+    const CONT_PREFIX: &str = " ";
+    const SUFFIX: &str = "  [r]";
+    const WRAPPED_SUFFIX: &str = " [r]";
+
+    let max_w = usize::from(area_width).max(1);
+    let label_style = Style::default().fg(Color::DarkGray);
+    let title_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let mut rows: Vec<String> = vec![String::new()];
+    let mut row_w = PREFIX.width().min(max_w);
+
+    for raw_ch in title.chars() {
+        let ch = if raw_ch.is_control() { ' ' } else { raw_ch };
+        let cw = ch.width().unwrap_or(0);
+        if !rows.last().is_none_or(String::is_empty) && row_w + cw > max_w {
+            rows.push(String::new());
+            row_w = CONT_PREFIX.width().min(max_w);
+        }
+        if let Some(last) = rows.last_mut() {
+            last.push(ch);
+        }
+        row_w += cw;
+    }
+
+    let suffix_fits = row_w + SUFFIX.width() <= max_w;
+    let total_text_rows = rows.len();
+    let mut lines: Vec<Line<'static>> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(idx, text)| {
+            let prefix_span = if idx == 0 {
+                Span::styled(PREFIX, label_style)
+            } else {
+                Span::styled(CONT_PREFIX, label_style)
+            };
+            let mut spans = vec![prefix_span, Span::styled(text, title_style)];
+            if idx + 1 == total_text_rows && suffix_fits {
+                spans.push(Span::styled(SUFFIX, label_style));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    if !suffix_fits {
+        lines.push(Line::from(Span::styled(WRAPPED_SUFFIX, label_style)));
+    }
+    lines
 }
 
 fn source_url_line(url: Option<&str>) -> Line<'static> {
@@ -899,7 +957,14 @@ fn render_prompt_modal(
     geom: &mut LayoutGeometry,
 ) {
     let is_url = matches!(pm.kind, PromptKind::SetSourceUrl);
-    let popup = centered_rect(area, if is_url { 72 } else { 56 }, 4);
+    let prompt = if is_url { "URL: " } else { "Title: " };
+    let target_width = u16::try_from(usize::from(area.width) * 80 / 100).unwrap_or(area.width);
+    let popup_width = target_width.min(area.width.saturating_sub(2)).max(16);
+    let inner_width = usize::from(popup_width.saturating_sub(2)).max(1);
+    let (rows, cursor_row, cursor_col) =
+        wrap_prompt_input(prompt, &pm.input.text, pm.input.cursor_chars, inner_width);
+    let popup_height = u16::try_from(rows.len().saturating_add(2)).unwrap_or(u16::MAX);
+    let popup = centered_rect(area, popup_width, popup_height);
     let title = match pm.kind {
         PromptKind::RenameNote => "Rename Note Title",
         PromptKind::CreateNote => "Create New Note",
@@ -922,55 +987,86 @@ fn render_prompt_modal(
         return;
     }
 
-    let prompt = if is_url { "URL: " } else { "Title: " };
-    let row = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: 1,
+    let visible_h = usize::from(inner.height);
+    let scroll = if cursor_row >= visible_h {
+        cursor_row + 1 - visible_h
+    } else {
+        0
     };
-    let field_cols = usize::from(row.width).saturating_sub(prompt.width());
-    let (visible, visible_cursor) =
-        scrolled_input(&pm.input.text, pm.input.cursor_chars, field_cols);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(prompt, Style::default().fg(Color::Cyan)),
-            Span::styled(visible.as_str(), Style::default().fg(Color::White)),
-        ])),
-        row,
-    );
-    set_input_cursor(frame, row, prompt, &visible, visible_cursor);
+    let lines: Vec<Line<'_>> = rows
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible_h)
+        .map(|(idx, row_text)| {
+            if idx == 0 {
+                Line::from(vec![
+                    Span::styled(prompt, Style::default().fg(Color::Cyan)),
+                    Span::styled(row_text.as_str(), Style::default().fg(Color::White)),
+                ])
+            } else {
+                Line::from(Span::styled(
+                    row_text.as_str(),
+                    Style::default().fg(Color::White),
+                ))
+            }
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    let cx = inner
+        .x
+        .saturating_add(u16::try_from(cursor_col).unwrap_or(0))
+        .min(inner.x + inner.width.saturating_sub(1));
+    let cy = inner
+        .y
+        .saturating_add(u16::try_from(cursor_row.saturating_sub(scroll)).unwrap_or(0))
+        .min(inner.y + inner.height.saturating_sub(1));
+    frame.set_cursor_position((cx, cy));
 }
 
-/// Keep a single-line field's cursor inside `max_cols` without dropping characters
-/// the user can still reach with the arrow keys.
-fn scrolled_input(text: &str, cursor_chars: usize, max_cols: usize) -> (String, usize) {
-    if max_cols == 0 {
-        return (String::new(), 0);
+/// Wraps a prompt's input across rows of `width` columns (the first row starts after
+/// `prompt`) and returns `(rows, cursor_row, cursor_col)`.
+fn wrap_prompt_input(
+    prompt: &str,
+    text: &str,
+    cursor_chars: usize,
+    width: usize,
+) -> (Vec<String>, usize, usize) {
+    let width = width.max(1);
+    let prompt_w = prompt.width().min(width);
+    let mut rows = vec![String::new()];
+    let mut row = 0usize;
+    let mut col = prompt_w;
+    let mut cursor_pos = None;
+
+    for (idx, raw_ch) in text.chars().enumerate() {
+        let ch = if raw_ch.is_control() { ' ' } else { raw_ch };
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + cw > width && col > 0 {
+            row += 1;
+            col = 0;
+            rows.push(String::new());
+        }
+        if idx == cursor_chars {
+            cursor_pos = Some((row, col));
+        }
+        rows[row].push(ch);
+        col += cw;
     }
-    let chars: Vec<char> = text.chars().collect();
-    let cursor = cursor_chars.min(chars.len());
-    let width = |slice: &[char]| -> usize {
-        slice
-            .iter()
-            .map(|ch| UnicodeWidthChar::width(*ch).unwrap_or(0))
-            .sum()
+
+    let (cursor_row, cursor_col) = match cursor_pos {
+        Some(pos) => pos,
+        None => {
+            if col >= width {
+                row += 1;
+                col = 0;
+                rows.push(String::new());
+            }
+            (row, col)
+        }
     };
-    let text_width = width(&chars);
-    let cursor_past_end = cursor == chars.len();
-    if text_width < max_cols || (text_width <= max_cols && !cursor_past_end) {
-        return (text.to_owned(), cursor);
-    }
-    let mut start = cursor;
-    while start > 0 && width(&chars[start - 1..cursor]) < max_cols {
-        start -= 1;
-    }
-    let mut end = cursor;
-    while end < chars.len() && width(&chars[start..=end]) <= max_cols {
-        end += 1;
-    }
-    let visible: String = chars[start..end].iter().collect();
-    (visible, cursor - start)
+    (rows, cursor_row, cursor_col)
 }
 
 fn render_preferences_modal(
@@ -1598,25 +1694,125 @@ mod tests {
     }
 
     #[test]
-    fn scrolled_input_keeps_the_cursor_on_screen() {
-        let (visible, cursor) = scrolled_input("abc", 3, 10);
-        assert_eq!(visible, "abc");
-        assert_eq!(cursor, 3);
+    fn wrap_prompt_input_splits_rows_and_tracks_cursor_across_lines() {
+        let (rows, row, col) = wrap_prompt_input("Title: ", "ab", 2, 10);
+        assert_eq!(rows, ["ab"]);
+        assert_eq!((row, col), (0, 9));
 
-        let (visible, cursor) = scrolled_input("abcdefghijk", 11, 10);
-        assert_eq!(visible, "cdefghijk");
-        assert_eq!(cursor, 9);
-        assert!(cursor < 10);
+        let (rows, row, col) = wrap_prompt_input("Title: ", "abc", 3, 10);
+        assert_eq!(rows, ["abc", ""]);
+        assert_eq!((row, col), (1, 0));
 
-        let (visible, cursor) = scrolled_input("abcdefghijk", 0, 10);
-        assert_eq!(visible, "abcdefghij");
-        assert_eq!(cursor, 0);
+        let (rows, row, col) = wrap_prompt_input("Title: ", "abcdefghij", 10, 10);
+        assert_eq!(rows, ["abc", "defghij"]);
+        assert_eq!((row, col), (1, 7));
 
-        let (visible, cursor) = scrolled_input("0123456789", 6, 5);
-        assert_eq!(visible, "23456");
-        assert_eq!(cursor, 4);
+        let (rows, row, col) = wrap_prompt_input("Title: ", "abcdefghij", 3, 10);
+        assert_eq!(rows, ["abc", "defghij"]);
+        assert_eq!((row, col), (1, 0));
 
-        assert_eq!(scrolled_input("abc", 1, 0), (String::new(), 0));
+        let (rows, row, col) = wrap_prompt_input("Title: ", "abcdefghij", 0, 10);
+        assert_eq!(rows, ["abc", "defghij"]);
+        assert_eq!((row, col), (0, 7));
+    }
+
+    #[test]
+    fn long_title_is_multiline_in_header_and_in_80_percent_wide_rename_popup() {
+        let long_title = "Star Monkey from 2001 by Small Rockets (was born from the ashes of Fiendish Games, a department of Criterion Games): find creators, write them to make it free and open source";
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(tx);
+        app.handle_worker_event(WorkerEvent::InitialNotes {
+            page: SearchPage {
+                total_matching: 1,
+                notes: vec![NoteSummary {
+                    guid: "g1".into(),
+                    title: long_title.to_owned(),
+                    created: None,
+                    updated: None,
+                    notebook_guid: None,
+                    tag_guids: Vec::new(),
+                    content_length: Some(240),
+                }],
+            },
+        });
+        app.handle_worker_event(WorkerEvent::CatalogLoaded {
+            notebooks: Vec::new(),
+            tags: Vec::new(),
+        });
+        app.handle_worker_event(WorkerEvent::NoteLoaded {
+            request_id: 1,
+            note: NoteDetail {
+                guid: NoteGuid::from("g1"),
+                title: long_title.to_owned(),
+                enml: "<en-note><div>body</div></en-note>".to_owned(),
+                created: None,
+                updated: None,
+                notebook_guid: None,
+                tag_guids: Vec::new(),
+                tag_names: Vec::new(),
+                source_url: Some("https://en.wikipedia.org/wiki/Small_Rockets".to_owned()),
+                content_length: Some(240),
+                resources: Vec::new(),
+            },
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+
+        let title_hit = app.geometry.title_hit;
+        assert!(
+            title_hit.height >= 3,
+            "long title must span multiple header rows, got {}",
+            title_hit.height
+        );
+        assert_eq!(app.geometry.notebook_hit.y, title_hit.y + title_hit.height);
+        assert_eq!(app.geometry.url_hit.y, title_hit.y + title_hit.height + 2);
+        assert_eq!(app.geometry.vim_area.y, title_hit.y + title_hit.height + 3);
+
+        let buf = terminal.backend().buffer();
+        let mut rendered_title = String::new();
+        for y in title_hit.y..title_hit.y + title_hit.height {
+            let row: String = (title_hit.x..title_hit.x + title_hit.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            let stripped = row.strip_prefix(' ').unwrap_or(&row).trim_end();
+            rendered_title.push_str(stripped);
+        }
+        assert_eq!(rendered_title, format!("Title: {long_title}  [r]"));
+
+        // Clicking the last wrapped line of the title opens the Rename Note Title popup.
+        app.handle_terminal_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: title_hit.x + 2,
+            row: title_hit.y + title_hit.height - 1,
+            modifiers: KeyModifiers::empty(),
+        }));
+        assert!(matches!(
+            app.modal,
+            ModalState::TextPrompt(TextPromptModal {
+                kind: PromptKind::RenameNote,
+                ..
+            })
+        ));
+
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let popup = app.geometry.modal_area.expect("rename popup");
+        let inner = app.geometry.modal_inner.expect("rename popup inner");
+        assert_eq!(popup.width, 80, "rename popup must be 80% of screen width");
+        assert!(
+            inner.height >= 3,
+            "rename popup must grow to fit all wrapped lines"
+        );
+
+        let buf = terminal.backend().buffer();
+        let mut popup_text = String::new();
+        for y in inner.y..inner.y + inner.height {
+            let row: String = (inner.x..inner.x + inner.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            popup_text.push_str(row.trim_end());
+        }
+        assert_eq!(popup_text, format!("Title: {long_title}"));
     }
 
     fn assert_pure_ascii_and_ansi16(buf: &ratatui::buffer::Buffer) {
