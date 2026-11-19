@@ -956,8 +956,11 @@ fn render_prompt_modal(
     area: Rect,
     geom: &mut LayoutGeometry,
 ) {
-    let is_url = matches!(pm.kind, PromptKind::SetSourceUrl);
-    let prompt = if is_url { "URL: " } else { "Title: " };
+    let prompt = match pm.kind {
+        PromptKind::RenameNote => "",
+        PromptKind::CreateNote => "Title: ",
+        PromptKind::SetSourceUrl => "URL: ",
+    };
     let target_width = u16::try_from(usize::from(area.width) * 80 / 100).unwrap_or(area.width);
     let popup_width = target_width.min(area.width.saturating_sub(2)).max(16);
     let inner_width = usize::from(popup_width.saturating_sub(2)).max(1);
@@ -1812,7 +1815,7 @@ mod tests {
                 .collect();
             popup_text.push_str(row.trim_end());
         }
-        assert_eq!(popup_text, format!("Title: {long_title}"));
+        assert_eq!(popup_text, long_title);
     }
 
     fn assert_pure_ascii_and_ansi16(buf: &ratatui::buffer::Buffer) {
